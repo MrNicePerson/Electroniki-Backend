@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 import express from 'express';
 import mongoose from 'mongoose';
@@ -14,12 +15,35 @@ import { getWhatsAppWebSessionManager } from './services/whatsappWebSessions.js'
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Trusted frontend origins.
+const allowedOrigins = new Set([
+  'https://electroniki.vercel.app',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+]);
+
+// Additional trusted origins can be configured through Render environment variables.
+const configuredOrigins = [
+  process.env.FRONTEND_URL,
+  ...(process.env.FRONTEND_URLS || '').split(','),
+];
+
+for (const value of configuredOrigins) {
+  if (!value || !value.trim()) continue;
+
+  try {
+    allowedOrigins.add(new URL(value.trim()).origin);
+  } catch {
+    console.error('Invalid frontend origin configured:', value);
+  }
+}
+
 export function createApp() {
   const app = express();
 
   app.disable('x-powered-by');
 
-  // Security headers
+  // Security headers.
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
@@ -32,7 +56,7 @@ export function createApp() {
     next();
   });
 
-  // Root API health-check route
+  // Root API health-check route.
   app.get('/', (_req, res) => {
     res.status(200).json({
       success: true,
@@ -42,8 +66,71 @@ export function createApp() {
     });
   });
 
-  // The browser app and API share one origin.
-  // Reject state-changing requests from other origins.
+  // CORS configuration for the Vercel frontend and local development.
+  app.use((req, res, next) => {
+    const origin = req.get('Origin');
+
+    if (!origin) {
+      return next();
+    }
+
+    let parsedOrigin;
+
+    try {
+      parsedOrigin = new URL(origin);
+    } catch {
+      return res.status(403).json({
+        error: 'Invalid request origin.',
+      });
+    }
+
+    if (!['http:', 'https:'].includes(parsedOrigin.protocol)) {
+      return res.status(403).json({
+        error: 'Invalid request protocol.',
+      });
+    }
+
+    const normalizedOrigin = parsedOrigin.origin;
+    const requestHost = String(req.get('Host') || '').toLowerCase();
+
+    // Allow either the same origin or an explicitly trusted frontend.
+    const isSameOrigin =
+      parsedOrigin.host.toLowerCase() === requestHost;
+
+    const isAllowedOrigin =
+      isSameOrigin || allowedOrigins.has(normalizedOrigin);
+
+    if (!isAllowedOrigin) {
+      if (req.method === 'OPTIONS') {
+        return res.status(403).json({
+          error: 'Cross-origin requests are not allowed.',
+        });
+      }
+
+      return next();
+    }
+
+    res.setHeader('Access-Control-Allow-Origin', normalizedOrigin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS'
+    );
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization'
+    );
+    res.setHeader('Vary', 'Origin');
+
+    // Handle browser CORS preflight requests.
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+
+    next();
+  });
+
+  // Reject state-changing requests from untrusted origins.
   app.use('/api', (req, res, next) => {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       return next();
@@ -51,20 +138,21 @@ export function createApp() {
 
     const origin = req.get('Origin');
 
-    if (req.get('Sec-Fetch-Site') === 'cross-site') {
-      return res.status(403).json({
-        error: 'Cross-site requests are not allowed.',
-      });
-    }
-
+    // Preserve existing behavior for requests without an Origin header.
     if (origin) {
       try {
-        const parsed = new URL(origin);
+        const parsedOrigin = new URL(origin);
+
+        const isSameOrigin =
+          parsedOrigin.host.toLowerCase() ===
+          String(req.get('Host') || '').toLowerCase();
+
+        const isAllowedOrigin =
+          isSameOrigin || allowedOrigins.has(parsedOrigin.origin);
 
         if (
-          !['http:', 'https:'].includes(parsed.protocol) ||
-          parsed.host.toLowerCase() !==
-            String(req.get('Host') || '').toLowerCase()
+          !['http:', 'https:'].includes(parsedOrigin.protocol) ||
+          !isAllowedOrigin
         ) {
           return res.status(403).json({
             error: 'Cross-origin requests are not allowed.',
@@ -80,12 +168,12 @@ export function createApp() {
     next();
   });
 
-  // Request body parsing
+  // Request body parsing.
   app.use(express.json({ limit: '16mb' }));
   app.use(express.urlencoded({ extended: true, limit: '12mb' }));
   app.use(cookieParser());
 
-  // Rate limiting for authentication endpoints
+  // Rate limiting for authentication endpoints.
   const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 20,
@@ -102,7 +190,8 @@ export function createApp() {
     standardHeaders: true,
     legacyHeaders: false,
     message: {
-      error: 'Too many password reset requests. Please try again after 15 minutes.',
+      error:
+        'Too many password reset requests. Please try again after 15 minutes.',
     },
   });
 
@@ -111,10 +200,10 @@ export function createApp() {
   app.use('/api/auth/forgot-password', passwordResetLimiter);
   app.use('/api/auth/reset-password', passwordResetLimiter);
 
-  // API routes
+  // API routes.
   app.use('/api', apiRouter);
 
-  // Safe JSON error handler for API routes
+  // Safe JSON error handler for API routes.
   app.use('/api', (err, _req, res, _next) => {
     console.error('API Error:', err?.message || err);
 
@@ -152,6 +241,10 @@ export async function startServer() {
       console.log(
         `ElectroHub SaaS server listening on http://0.0.0.0:${port}`
       );
+
+      console.log('Allowed frontend origins:', [
+        ...allowedOrigins,
+      ]);
 
       startAutomationScheduler();
 
@@ -281,7 +374,7 @@ export async function ensurePlatformAdmin() {
   return true;
 }
 
-// Start server if invoked directly or via server.ts
+// Start server if invoked directly or via server.ts.
 if (
   process.argv[1] &&
   (
