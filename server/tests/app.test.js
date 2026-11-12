@@ -1168,6 +1168,152 @@ test('WhatsApp Web session manager restores a shop LocalAuth session and sends a
   }
 });
 
+test('WhatsApp Web session manager retries a transient destroyed browser context', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { createWhatsAppWebSessionManager } = await import('../services/whatsappWebSessions.js');
+  const env = { WHATSAPP_WEB_ENABLED: 'true' };
+  let created = 0;
+  let destroyed = 0;
+  const clientFactory = async () => {
+    const client = new EventEmitter();
+    created += 1;
+    client.initialize = async () => {
+      if (created === 1) throw new Error('Protocol error (Runtime.callFunctionOn): Execution context was destroyed.');
+      client.emit('qr', 'mock-qr');
+    };
+    client.destroy = async () => { destroyed += 1; };
+    return client;
+  };
+  const manager = createWhatsAppWebSessionManager({
+    env,
+    dataPath: 'mock-whatsapp-session-data',
+    clientFactory,
+    qrEncoder: async () => 'data:image/png;base64,bW9jay1xci==',
+  });
+
+  await manager.link('retry-shop');
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const status = await manager.getStatus('retry-shop');
+  assert.equal(created, 2, 'one clean browser client is created after the transient protocol failure');
+  assert.equal(destroyed, 1, 'the failed browser client is closed before retrying');
+  assert.equal(status.status, 'qr');
+  assert.equal(status.qrDataUrl, 'data:image/png;base64,bW9jay1xci==');
+});
+
+test('WhatsApp Web Link clears a failed saved profile before starting a fresh pairing', async () => {
+  const { EventEmitter } = await import('node:events');
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { createWhatsAppWebSessionManager } = await import('../services/whatsappWebSessions.js');
+  const dataPath = await fs.mkdtemp(path.join(os.tmpdir(), 'electrohub-wa-link-reset-test-'));
+  const env = { WHATSAPP_WEB_ENABLED: 'true' };
+  let created = 0;
+  let destroyed = 0;
+  const clientFactory = async () => {
+    const client = new EventEmitter();
+    created += 1;
+    client.initialize = async () => {
+      if (created === 1) throw new Error('mock permanent startup failure');
+      client.emit('qr', 'mock-qr');
+    };
+    client.destroy = async () => { destroyed += 1; };
+    return client;
+  };
+  const manager = createWhatsAppWebSessionManager({
+    env,
+    dataPath,
+    clientFactory,
+    qrEncoder: async () => 'data:image/png;base64,bW9jay1xci==',
+  });
+
+  try {
+    const oldProfile = manager.sessionPath('retry-shop');
+    await fs.mkdir(oldProfile, { recursive: true });
+    await fs.writeFile(path.join(oldProfile, 'stale-profile-marker'), 'stale');
+    await manager.link('retry-shop');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal((await manager.getStatus('retry-shop')).status, 'error');
+    await manager.link('retry-shop');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await assert.rejects(() => fs.access(path.join(oldProfile, 'stale-profile-marker')));
+    assert.equal(created, 2);
+    assert.equal(destroyed, 1, 'the previous failed browser client is closed before relinking');
+    assert.equal((await manager.getStatus('retry-shop')).status, 'qr');
+  } finally {
+    await manager.shutdown();
+    await fs.rm(dataPath, { recursive: true, force: true });
+  }
+});
+
+test('WhatsApp Web session manager clears a repeatedly failing profile and creates a fresh QR automatically', async () => {
+  const { EventEmitter } = await import('node:events');
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { createWhatsAppWebSessionManager } = await import('../services/whatsappWebSessions.js');
+  const dataPath = await fs.mkdtemp(path.join(os.tmpdir(), 'electrohub-wa-stale-session-test-'));
+  const env = { WHATSAPP_WEB_ENABLED: 'true' };
+  let created = 0;
+  const clientFactory = async () => {
+    const client = new EventEmitter();
+    created += 1;
+    client.initialize = async () => {
+      if (created === 1) throw new Error('Protocol error (Runtime.callFunctionOn): Execution context was destroyed.');
+      if (created === 2) throw new Error("Cannot read properties of null (reading 'Socket')");
+      client.emit('qr', 'fresh-qr');
+    };
+    client.destroy = async () => {};
+    return client;
+  };
+  const manager = createWhatsAppWebSessionManager({
+    env, dataPath, clientFactory,
+    qrEncoder: async () => 'data:image/png;base64,bW9jay1xci==',
+  });
+  try {
+    const oldProfile = manager.sessionPath('stale-session-shop');
+    await fs.mkdir(oldProfile, { recursive: true });
+    await fs.writeFile(path.join(oldProfile, 'stale-profile-marker'), 'stale');
+    await manager.link('stale-session-shop');
+    await new Promise((resolve) => setTimeout(resolve, 2200));
+    await assert.rejects(() => fs.access(path.join(oldProfile, 'stale-profile-marker')));
+    assert.equal(created, 3);
+    assert.equal((await manager.getStatus('stale-session-shop')).status, 'qr');
+  } finally {
+    await fs.rm(dataPath, { recursive: true, force: true });
+  }
+});
+
+test('WhatsApp Web build cache rejects logged-out landing HTML and caches the real app page', async () => {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { createServer } = await import('node:http');
+  const { prepareWhatsAppWebVersion } = await import('../services/whatsappWebSessions.js');
+  const cachePath = await fs.mkdtemp(path.join(os.tmpdir(), 'electrohub-wa-web-cache-test-'));
+  let html = '<!doctype html><html id="whatsapp-web-logged-out"></html>';
+  const server = await new Promise((resolve) => {
+    const listener = createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(html);
+    }).listen(0, '127.0.0.1', () => resolve(listener));
+  });
+  const archiveTemplate = `http://127.0.0.1:${server.address().port}/{version}`;
+  try {
+    await assert.rejects(
+      () => prepareWhatsAppWebVersion({ version: '2.test-build', cachePath, archiveTemplate }),
+      /not a valid logged-in app page/i,
+    );
+    html = '<!doctype html><html id="whatsapp-web"></html>';
+    assert.equal(await prepareWhatsAppWebVersion({ version: '2.test-build', cachePath, archiveTemplate }), cachePath);
+    assert.equal(await fs.readFile(path.join(cachePath, '2.test-build.html'), 'utf8'), html);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(cachePath, { recursive: true, force: true });
+  }
+});
+
 test('Installment sales save customer and guarantor photos inside one details object', async () => {
   resetInMemoryStateForTests();
   const { db } = await import('../db.js');

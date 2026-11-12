@@ -4,6 +4,7 @@ node_modules/
 !.env.example
 .data/
 .wwebjs_auth/
+.wwebjs_cache/
 whatsapp-sessions/
 coverage/
 npm-debug.log*

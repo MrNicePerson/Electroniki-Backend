@@ -1,0 +1,13 @@
+import express from 'express';import fs from 'node:fs';import path from 'node:path';
+process.env.NODE_ENV='test';process.env.JWT_SECRET='isolated-browser-test-secret-not-for-real-accounts';
+const {db,resetInMemoryStateForTests}=await import('./server/db.js');
+const {createApp}=await import('./server/index.js');const {signAuthToken}=await import('./server/middleware/auth.js');
+resetInMemoryStateForTests();
+const shop=await db.Shop.create({name:'Isolated UI Test',openingCash:0});
+const user=await db.User.create({shopId:shop.id,name:'UI Tester',role:'owner',active:true,email:'ui@test.invalid'});
+const token=signAuthToken(user);const app=express();
+app.use((req,res,next)=>{req.headers.authorization=`Bearer ${token}`;next();});
+app.post('/api/ocr/invoice',express.json({limit:'16mb'}),(req,res)=>{const fixture=JSON.parse(fs.readFileSync('handwritten-invoice-test-result.json','utf8')).draft;res.json({ocrStatus:'extracted',draft:fixture,limitationNote:'Isolated UI test: previously extracted invoice draft. No live MongoDB writes.'});});
+app.use(createApp());app.use(express.static(path.resolve('../frontend/dist')));
+app.get('*',(req,res)=>res.sendFile(path.resolve('../frontend/dist/index.html')));
+app.listen(5180,'127.0.0.1',()=>console.log('Isolated UI verification at http://127.0.0.1:5180; all records are in memory.'));
