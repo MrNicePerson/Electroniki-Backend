@@ -23,6 +23,7 @@ const shopSchema = new Schema(
     currency: { type: String, default: 'PKR' },
     openingCash: { type: Number, default: 0 },
     taxNumber: { type: String, default: '' },
+    geminiApiKeyEncrypted: { type: String, default: '' },
     automation: { type: Schema.Types.Mixed, default: () => ({}) },
   },
   { timestamps: true }

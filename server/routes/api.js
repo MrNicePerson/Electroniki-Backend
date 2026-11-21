@@ -32,6 +32,7 @@ import {
 } from '../utils/calculations.js';
 import { isWhatsAppAutomationConfigured, normalizeWhatsAppNumber, sendWhatsAppDocument } from '../utils/whatsappCloud.js';
 import { getWhatsAppWebSessionManager } from '../services/whatsappWebSessions.js';
+import { decryptSecret, encryptSecret } from '../utils/secrets.js';
 
 export const apiRouter = express.Router();
 
@@ -52,6 +53,26 @@ function isValidDateOnly(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) &&
     Number.isFinite(Date.parse(`${value}T00:00:00Z`)) &&
     new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+}
+
+async function getAvailableProductsAfterHeldOrders(shopId, excludeHeldOrderId = '') {
+  const [products, heldOrders] = await Promise.all([
+    db.Product.find({ shopId }),
+    db.HeldOrder.find({ shopId, status: 'Held' }),
+  ]);
+  const reserved = new Map();
+  for (const order of heldOrders) {
+    if (excludeHeldOrderId && String(order.id) === String(excludeHeldOrderId)) continue;
+    for (const item of order.cartItems || []) {
+      const productId = String(item.productId || item.id || '');
+      if (!productId) continue;
+      reserved.set(productId, (reserved.get(productId) || 0) + Math.max(0, Math.floor(num(item.qty))));
+    }
+  }
+  return new Map(products.map((product) => [String(product.id), {
+    ...product,
+    stock: Math.max(0, num(product.stock) - (reserved.get(String(product.id)) || 0)),
+  }]));
 }
 
 function pakistanPeriodBounds(period, selectedDate) {
@@ -483,6 +504,7 @@ apiRouter.get('/admin/summary', async (_req, res, next) => {
           accentColor: shop.invoiceDesign?.accentColor || '#0757a6',
           logo: shop.invoiceDesign?.logo || '',
         },
+        geminiConfigured: Boolean(shop.geminiApiKeyEncrypted),
         createdAt: shop.createdAt || null,
         usersCount: users.filter((user) => String(user.shopId) === String(shop.id)).length,
         activeUsersCount: users.filter((user) => String(user.shopId) === String(shop.id) && user.active !== false).length,
@@ -510,11 +532,19 @@ apiRouter.put('/admin/shops/:shopId/invoice-design', async (req, res, next) => {
     const accentColor = /^#[0-9a-f]{6}$/i.test(String(design.accentColor || ''))
       ? String(design.accentColor)
       : (shop.invoiceDesign?.accentColor || '#0757a6');
+    const newGeminiKey = String(req.body?.geminiApiKey || '').trim();
+    if (newGeminiKey && (newGeminiKey.length < 20 || newGeminiKey.length > 256)) {
+      return res.status(400).json({ error: 'Enter a valid Gemini API key.' });
+    }
     const updated = await db.Shop.updateOne({ _id: shop.id }, {
       invoiceDesign: { theme, accentColor, logo },
+      ...(req.body?.removeGeminiApiKey ? { geminiApiKeyEncrypted: '' } : newGeminiKey
+        ? { geminiApiKeyEncrypted: encryptSecret(newGeminiKey) } : {}),
     });
-    await logAudit(shop.id, req.user, 'invoice_design_updated', 'Shop', shop.id, `Updated invoice design for ${shop.name}`);
-    return res.json({ invoiceDesign: updated.invoiceDesign });
+    const keyChanged = Boolean(req.body?.removeGeminiApiKey || String(req.body?.geminiApiKey || '').trim());
+    await logAudit(shop.id, req.user, keyChanged ? 'shop_ai_key_updated' : 'invoice_design_updated', 'Shop', shop.id,
+      keyChanged ? `Updated invoice design or Gemini configuration for ${shop.name}` : `Updated invoice design for ${shop.name}`);
+    return res.json({ invoiceDesign: updated.invoiceDesign, geminiConfigured: Boolean(updated.geminiApiKeyEncrypted) });
   } catch (err) {
     return next(err);
   }
@@ -522,7 +552,7 @@ apiRouter.put('/admin/shops/:shopId/invoice-design', async (req, res, next) => {
 
 apiRouter.post('/admin/shops', async (req, res, next) => {
   try {
-    const { shopName, ownerName, email, password, phone = '', whatsapp = '', city = '', address = '' } = req.body || {};
+    const { shopName, ownerName, email, password, phone = '', whatsapp = '', city = '', address = '', geminiApiKey = '' } = req.body || {};
     const cleanShop = String(shopName || '').trim();
     const cleanOwner = String(ownerName || '').trim();
     const cleanEmail = String(email || '').trim().toLowerCase();
@@ -532,6 +562,18 @@ apiRouter.post('/admin/shops', async (req, res, next) => {
     }
     if (await db.User.findOne({ email: cleanEmail })) {
       return res.status(409).json({ error: 'This email already has an account. Use another email.' });
+    }
+    const cleanGeminiKey = String(geminiApiKey || '').trim();
+    if (cleanGeminiKey && (cleanGeminiKey.length < 20 || cleanGeminiKey.length > 256)) {
+      return res.status(400).json({ error: 'Enter a valid Gemini API key.' });
+    }
+    const requestedDesign = req.body?.invoiceDesign || {};
+    const themes = new Set(['blue', 'teal', 'violet', 'graphite']);
+    const invoiceTheme = themes.has(requestedDesign.theme) ? requestedDesign.theme : 'blue';
+    const accentColor = /^#[0-9a-f]{6}$/i.test(String(requestedDesign.accentColor || '')) ? String(requestedDesign.accentColor) : '#0757a6';
+    const invoiceLogo = String(requestedDesign.logo || '');
+    if (invoiceLogo.length > 350_000 || (invoiceLogo && !/^data:image\/(png|jpeg|webp);base64,/i.test(invoiceLogo))) {
+      return res.status(400).json({ error: 'Invoice logo must be a PNG, JPEG, or WebP image smaller than 250 KB.' });
     }
 
     const created = await runInTransaction(async () => {
@@ -545,6 +587,8 @@ apiRouter.post('/admin/shops', async (req, res, next) => {
         invoicePrefix: 'INV',
         currency: 'PKR',
         openingCash: 0,
+        invoiceDesign: { theme: invoiceTheme, accentColor, logo: invoiceLogo },
+        geminiApiKeyEncrypted: encryptSecret(cleanGeminiKey),
       });
       const owner = await db.User.create({
         shopId: shop.id,
@@ -558,7 +602,7 @@ apiRouter.post('/admin/shops', async (req, res, next) => {
       return { shop, owner };
     });
     return res.status(201).json({
-      shop: { id: created.shop.id, name: created.shop.name, city: created.shop.city },
+      shop: { id: created.shop.id, name: created.shop.name, city: created.shop.city, geminiConfigured: Boolean(created.shop.geminiApiKeyEncrypted), invoiceDesign: created.shop.invoiceDesign },
       owner: serializeAdminUser(created.owner, created.shop.name),
     });
   } catch (err) {
@@ -856,6 +900,7 @@ apiRouter.get('/settings', async (req, res) => {
     lastLoginAt: u.lastLoginAt,
   }));
   const shopData = shop?.toObject ? shop.toObject() : shop;
+  if (shopData) delete shopData.geminiApiKeyEncrypted;
   return res.json({ shop: shopData ? { ...shopData, whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shopData, users });
 });
 
@@ -915,6 +960,7 @@ apiRouter.put('/settings', requireOwner, async (req, res) => {
     );
 
     const shopData = updated?.toObject ? updated.toObject() : updated;
+    if (shopData) delete shopData.geminiApiKeyEncrypted;
     return res.json({ shop: shopData ? { ...shopData, whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shopData });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update shop settings.' });
@@ -1293,6 +1339,21 @@ apiRouter.put('/customers/:id', async (req, res) => {
   }
 });
 
+apiRouter.delete('/customers/:id', async (req, res) => {
+  const customer = await db.Customer.findOne({ _id: req.params.id, shopId: req.shopId });
+  if (!customer) return res.status(404).json({ error: 'Customer not found.' });
+  const [sales, plans] = await Promise.all([
+    db.Sale.find({ shopId: req.shopId, customerId: customer.id }),
+    db.InstallmentPlan.find({ shopId: req.shopId, customerId: customer.id }),
+  ]);
+  if (sales.length || plans.length || num(customer.creditBalance) !== 0) {
+    return res.status(409).json({ error: 'This customer has sales, installment plans, or a credit balance. Edit the details and keep the account history.' });
+  }
+  await db.Customer.deleteOne({ _id: customer.id, shopId: req.shopId });
+  await logAudit(req.shopId, req.user, 'customer_deleted', 'Customer', customer.id, `Deleted customer "${customer.name}"`);
+  return res.json({ ok: true });
+});
+
 // ============================================================================
 // 5. NEW SALE & BILLS WORKFLOW (Transaction-Safe + Stock Validated)
 // ============================================================================
@@ -1343,11 +1404,7 @@ apiRouter.post('/sales', async (req, res) => {
       }
     }
 
-    const shopProducts = await db.Product.find({ shopId: req.shopId });
-    const productsById = new Map();
-    for (const p of shopProducts) {
-      productsById.set(String(p.id), p);
-    }
+    const productsById = await getAvailableProductsAfterHeldOrders(req.shopId, req.body?.heldOrderId || '');
 
     const stockCheck = validateStockAvailability(items, productsById);
     if (!stockCheck.valid) {
@@ -1873,6 +1930,69 @@ apiRouter.post('/installments/plans', async (req, res) => {
   }
 });
 
+apiRouter.put('/installments/:planId', async (req, res) => {
+  try {
+    const existing = await db.InstallmentPlan.findOne({ _id: req.params.planId, shopId: req.shopId });
+    if (!existing) return res.status(404).json({ error: 'Installment plan not found.' });
+    const body = req.body || {};
+    const months = body.months === undefined ? Number(existing.months) : Number(body.months);
+    const monthlyAmount = body.monthlyAmount === undefined ? num(existing.monthlyAmount) : Number(body.monthlyAmount);
+    if (!Number.isSafeInteger(months) || months < 1 || months > 60 || !Number.isFinite(monthlyAmount) || monthlyAmount < 0 ||
+        body.startDate !== undefined && !isValidDateOnly(body.startDate) || body.nextDueDate !== undefined && !isValidDateOnly(body.nextDueDate)) {
+      return res.status(400).json({ error: 'Enter valid dates, 1–60 months, and a non-negative monthly amount.' });
+    }
+    const details = existing.installmentDetails || {};
+    const customer = { ...(details.customer || {}) };
+    const guarantor = { ...(details.guarantor || {}) };
+    for (const [field, target] of [['customerName', customer], ['phone', customer], ['whatsapp', customer], ['cnic', customer], ['address', customer], ['guarantor', guarantor], ['guarantorPhone', guarantor], ['guarantorCnic', guarantor], ['guarantorAddress', guarantor]]) {
+      if (body[field] !== undefined) {
+        const destination = field === 'customerName' ? 'name' : field === 'guarantor' ? 'name' : field.startsWith('guarantor') ? field.slice('guarantor'.length, field.length).replace(/^./, (letter) => letter.toLowerCase()) : field;
+        target[destination] = String(body[field] || '').trim().slice(0, 300);
+      }
+    }
+    const nextPlanDetails = { ...(details.plan || {}), months, monthlyAmount };
+    if (body.startDate !== undefined) nextPlanDetails.startDate = body.startDate;
+    if (body.nextDueDate !== undefined) nextPlanDetails.nextDueDate = body.nextDueDate;
+    const updated = await db.InstallmentPlan.updateOne({ _id: existing.id, shopId: req.shopId }, {
+      customerName: customer.name || existing.customerName,
+      phone: customer.phone || '', whatsapp: customer.whatsapp || '', cnic: customer.cnic || '', address: customer.address || '',
+      guarantor: guarantor.name || '', guarantorPhone: guarantor.phone || '', guarantorCnic: guarantor.cnic || '', guarantorAddress: guarantor.address || '',
+      months, monthlyAmount,
+      startDate: nextPlanDetails.startDate || existing.startDate,
+      nextDueDate: nextPlanDetails.nextDueDate || existing.nextDueDate,
+      installmentDetails: { ...details, customer, guarantor, plan: nextPlanDetails },
+    });
+    await logAudit(req.shopId, req.user, 'installment_plan_edited', 'InstallmentPlan', existing.id,
+      `Updated customer or schedule details for installment plan ${existing.planNo || existing.invoiceNo}`);
+    return res.json({ plan: updated });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to update installment plan.' });
+  }
+});
+
+apiRouter.delete('/installments/:planId', async (req, res) => {
+  try {
+    const plan = await db.InstallmentPlan.findOne({ _id: req.params.planId, shopId: req.shopId });
+    if (!plan) return res.status(404).json({ error: 'Installment plan not found.' });
+    const [payments, sale] = await Promise.all([
+      db.InstallmentPayment.find({ shopId: req.shopId, planId: plan.id }),
+      plan.saleId ? db.Sale.findOne({ _id: plan.saleId, shopId: req.shopId }) : null,
+    ]);
+    if (payments.length || num(plan.advancePaid) > 0 || sale && ((sale.items || []).length > 0 || num(sale.paid) > 0 || num(sale.cashCollected) > 0 || num(sale.bankCollected) > 0)) {
+      return res.status(409).json({ error: 'This plan has received money, payments, or product sales. Keep it so the ledger and invoice history remain complete.' });
+    }
+    await runInTransaction(async () => {
+      await db.InstallmentPlan.deleteOne({ _id: plan.id, shopId: req.shopId });
+      if (sale) await db.Sale.deleteOne({ _id: sale.id, shopId: req.shopId });
+      await logAudit(req.shopId, req.user, 'installment_plan_deleted', 'InstallmentPlan', plan.id,
+        `Deleted unpaid installment plan ${plan.planNo || plan.invoiceNo}`);
+    });
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to delete installment plan.' });
+  }
+});
+
 apiRouter.patch('/installments/:planId/reminders', requireOwner, async (req, res) => {
   const enabled = req.body?.enabled === true;
   const customerConsent = req.body?.customerConsent === true;
@@ -2052,8 +2172,8 @@ apiRouter.post('/ocr/invoice', async (req, res) => {
     const isPdf = String(mimeType).includes('pdf') || String(fileName).toLowerCase().endsWith('.pdf');
 
     // Invoice OCR goes directly to the Google Gemini API (Google AI Studio).
-    const geminiApiKey = (process.env.GEMINI_API_KEY || '').trim();
-    const apiKey = geminiApiKey !== 'MY_GEMINI_API_KEY' ? geminiApiKey : '';
+    const currentShop = await db.Shop.findById(req.shopId);
+    const apiKey = decryptSecret(currentShop?.geminiApiKeyEncrypted);
     const models = [...new Set([String(process.env.GEMINI_MODEL || process.env.GEMINI_INVOICE_MODEL || 'gemini-3.8-flash').trim(), 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite'])];
     let ocrFailure = '';
     const hasRealKey = Boolean(apiKey && dataUrl && dataUrl.startsWith('data:image/'));
@@ -2159,7 +2279,7 @@ apiRouter.post('/ocr/invoice', async (req, res) => {
           ? ` (HTTP ${status}: ${String(error.message || '').replaceAll(apiKey, '[redacted]').slice(0, 180)})`
           : '';
         ocrFailure = [401, 403].includes(status)
-          ? 'Google AI Studio rejected its API key or model access. Check GEMINI_API_KEY and GEMINI_MODEL in backend/.env.'
+          ? 'Google AI Studio rejected this shop’s Gemini key or model access. Ask the Super Admin to verify the key and model access.'
           : [429, 500, 502, 503, 504].includes(status) || /timeout|deadline|abort|temporar/i.test(error.message || '')
             ? 'Automatic invoice reading is temporarily busy. Try again shortly; no stock was saved.'
             : `Automatic invoice reading failed${providerHint}. Review or enter the items manually; no stock was saved.`;
@@ -2184,7 +2304,7 @@ apiRouter.post('/ocr/invoice', async (req, res) => {
     return res.json({
       ocrStatus: 'manual_required',
       limitationNote: !apiKey
-        ? 'Google AI Studio invoice reading is not configured. Set GEMINI_API_KEY in backend/.env; the original invoice is attached for manual review. Stock changes only after confirmation.'
+        ? 'Gemini invoice reading is not configured for this shop. Ask the Super Admin to add its Gemini API key; the invoice stays attached for manual review.'
         : ocrFailure || 'Invoice could not be read. No product data was guessed. Enter the supplier and invoice items manually; inventory will remain unchanged until you confirm.',
       draft: {
         supplier: '',
@@ -2666,6 +2786,9 @@ apiRouter.post('/orders', async (req, res) => {
     if (req.body?.heldOrderId) {
       const existing = await db.HeldOrder.findOne({ _id: req.body.heldOrderId, shopId: req.shopId, status: 'Held' });
       if (!existing) return res.status(404).json({ error: 'The resumed held bill no longer exists.' });
+      const availableProducts = await getAvailableProductsAfterHeldOrders(req.shopId, existing.id);
+      const stockCheck = validateStockAvailability(cartItems, availableProducts);
+      if (!stockCheck.valid) return res.status(400).json({ error: stockCheck.errors[0], errors: stockCheck.errors });
       const updatedOrder = await db.HeldOrder.updateOne({ _id: existing.id, shopId: req.shopId, status: 'Held' }, {
         customerId, customerName: String(customerName || 'Walk-in customer').trim(), phone: String(phone || '').trim(),
         salePhone: String(salePhone || '').trim(), saleCnic: String(saleCnic || '').trim(), saleAddress: String(saleAddress || '').trim(),
@@ -2673,6 +2796,10 @@ apiRouter.post('/orders', async (req, res) => {
       });
       return res.json({ order: updatedOrder, updated: true });
     }
+
+    const availableProducts = await getAvailableProductsAfterHeldOrders(req.shopId);
+    const stockCheck = validateStockAvailability(cartItems, availableProducts);
+    if (!stockCheck.valid) return res.status(400).json({ error: stockCheck.errors[0], errors: stockCheck.errors });
 
     const prefix = status === 'Held' ? 'HOLD' : 'ORD';
     const orderNo = `${prefix}-${String(Date.now()).slice(-5)}`;
@@ -2800,6 +2927,22 @@ apiRouter.post('/suppliers', async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: 'Failed to create supplier.' });
   }
+});
+
+apiRouter.delete('/suppliers/:id', async (req, res) => {
+  const supplier = await db.Supplier.findOne({ _id: req.params.id, shopId: req.shopId });
+  if (!supplier) return res.status(404).json({ error: 'Supplier not found.' });
+  const [receipts, payments] = await Promise.all([
+    db.StockReceipt.find({ shopId: req.shopId }),
+    db.FinancialTransaction.find({ shopId: req.shopId, type: 'supplier_payment', partyName: supplier.name }),
+  ]);
+  const hasHistory = receipts.some((receipt) => String(receipt.supplier || '').toLowerCase() === supplier.name.toLowerCase());
+  if (hasHistory || payments.length || num(supplier.balancePayable) !== 0) {
+    return res.status(409).json({ error: 'This supplier has purchase invoices, payments, or an outstanding payable. Keep the account to preserve its statement history.' });
+  }
+  await db.Supplier.deleteOne({ _id: supplier.id, shopId: req.shopId });
+  await logAudit(req.shopId, req.user, 'supplier_deleted', 'Supplier', supplier.id, `Deleted supplier "${supplier.name}"`);
+  return res.json({ ok: true });
 });
 
 apiRouter.post('/suppliers/:id/pay', async (req, res) => {
@@ -2969,6 +3112,26 @@ apiRouter.get('/expenses/:id/attachment', async (req, res) => {
     return res.json({ name: expense.attachmentName || 'receipt', dataUrl: expense.attachmentDataUrl });
   } catch {
     return res.status(500).json({ error: 'Failed to load expense receipt.' });
+  }
+});
+
+apiRouter.delete('/expenses/:id', async (req, res) => {
+  try {
+    const existing = await db.Expense.findOne({ _id: req.params.id, shopId: req.shopId });
+    if (!existing) return res.status(404).json({ error: 'Expense not found.' });
+    await runInTransaction(async () => {
+      if (String(existing.paymentMethod || '').toLowerCase() === 'bank' && existing.bankName) {
+        const account = await db.BankAccount.findOne({ shopId: req.shopId, bankName: existing.bankName });
+        if (account) await db.BankAccount.updateOne({ _id: account.id, shopId: req.shopId }, { balance: signedNum(account.balance) + num(existing.amount) });
+      }
+      await db.FinancialTransaction.deleteOne({ shopId: req.shopId, type: 'expense', relatedId: existing.id });
+      await db.Expense.deleteOne({ _id: existing.id, shopId: req.shopId });
+      await logAudit(req.shopId, req.user, 'expense_deleted', 'Expense', existing.id,
+        `Deleted expense "${existing.title}" (Rs. ${num(existing.amount).toLocaleString()})`);
+    });
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to delete expense.' });
   }
 });
 
@@ -3258,6 +3421,32 @@ apiRouter.post('/cash-register/close', async (req, res) => {
   await logAudit(req.shopId, req.user, 'cash_session_closed', 'CashSession', closed.id,
     `Cash register closed; expected Rs. ${totals.expectedClosingAmount.toLocaleString()}, counted Rs. ${actualClosingAmount.toLocaleString()}`);
   return res.json({ session: closed, totals });
+});
+
+apiRouter.patch('/cash-register/:id/reconcile', async (req, res) => {
+  const actualClosingAmount = Number(req.body?.actualClosingAmount);
+  if (!Number.isFinite(actualClosingAmount) || actualClosingAmount < 0) {
+    return res.status(400).json({ error: 'Enter a valid counted closing cash amount.' });
+  }
+  const session = await db.CashSession.findOne({ _id: req.params.id, shopId: req.shopId, status: 'closed', autoClosed: true });
+  if (!session) return res.status(404).json({ error: 'Auto-closed cash session not found.' });
+  const transactions = await db.FinancialTransaction.find({ shopId: req.shopId });
+  const closedAt = new Date(session.closedAt || session.updatedAt || session.openedAt).getTime();
+  const totals = calculateCashSessionTotals(transactions, session, Number.isFinite(closedAt) ? closedAt : Date.now());
+  const difference = actualClosingAmount - totals.expectedClosingAmount;
+  const updated = await db.CashSession.updateOne({ _id: session.id, shopId: req.shopId }, {
+    actualClosingAmount,
+    expectedClosingAmount: totals.expectedClosingAmount,
+    difference,
+    closingNote: String(req.body?.note || '').trim(),
+    autoClosed: false,
+    closedBy: req.user.name,
+    cashIn: totals.cashIn,
+    cashOut: totals.cashOut,
+  });
+  await logAudit(req.shopId, req.user, 'cash_session_reconciled', 'CashSession', session.id,
+    `Reconciled previously auto-closed cash session; expected Rs. ${totals.expectedClosingAmount.toLocaleString()}, counted Rs. ${actualClosingAmount.toLocaleString()}`);
+  return res.json({ session: updated });
 });
 
 apiRouter.post('/finance/banks', async (req, res) => {

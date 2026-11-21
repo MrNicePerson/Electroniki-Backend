@@ -47,7 +47,7 @@ Open <http://localhost:5173>. The Vite dev server forwards `/api` requests to th
 
 ## Environment variables and optional integrations
 
-`server/index.js` loads `backend/.env` through `dotenv/config`. MongoDB URI and JWT secret are required. Gemini invoice OCR, SMTP password-reset email, and WhatsApp Cloud API credentials are optional; without Gemini, supplier invoice details can be entered manually. WhatsApp automation also needs approved Meta message templates and recipients configured in the shop settings. See `.env.example` for every supported environment variable.
+`server/index.js` loads `backend/.env` through `dotenv/config`. MongoDB URI and JWT secret are required. The Super Admin assigns a separate Gemini API key to each shop during shop creation and can rotate or remove it from Invoice design. Shop keys are encrypted at rest using `SHOP_SECRET_ENCRYPTION_KEY`; if it is not set, the backend derives the encryption key from `JWT_SECRET`. Keep the selected encryption secret stable after keys are saved. Without a shop Gemini key, supplier invoice details can be entered manually. SMTP password-reset email and WhatsApp Cloud API credentials are optional. WhatsApp automation also needs approved Meta message templates and recipients configured in the shop settings.
 
 ### QR-linked WhatsApp invoice PDFs (optional)
 
