@@ -2,10 +2,12 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import QRCode from 'qrcode';
+import mongoose from 'mongoose';
 import WhatsAppWeb from 'whatsapp-web.js';
+import { MongoStore } from 'wwebjs-mongo';
 import { normalizeWhatsAppNumber } from '../utils/whatsappCloud.js';
 
-const { Client, LocalAuth, MessageMedia } = WhatsAppWeb;
+const { Client, RemoteAuth, MessageMedia } = WhatsAppWeb;
 
 const truthy = (value) => String(value || '').trim().toLowerCase() === 'true';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -52,10 +54,46 @@ function shopSessionId(shopId) {
   return `shop-${crypto.createHash('sha256').update(String(shopId)).digest('hex').slice(0, 32)}`;
 }
 
+function remoteSessionName(shopId) {
+  return `RemoteAuth-${shopSessionId(shopId)}`;
+}
+
+function createMongoSessionStore(mongooseInstance, dataPath) {
+  const mongoStore = new MongoStore({ mongoose: mongooseInstance });
+  return {
+    sessionExists: (options) => mongoStore.sessionExists(options),
+    async save(options) {
+      // wwebjs-mongo reads the archive from process.cwd(), while RemoteAuth
+      // writes it under dataPath. Bridge that path when a custom data path is used.
+      const archiveName = `${options.session}.zip`;
+      const sourcePath = path.join(dataPath, archiveName);
+      const storePath = path.resolve(process.cwd(), archiveName);
+      if (sourcePath === storePath) return mongoStore.save(options);
+      await fs.copyFile(sourcePath, storePath);
+      try {
+        return await mongoStore.save(options);
+      } finally {
+        await fs.rm(storePath, { force: true });
+      }
+    },
+    extract: (options) => mongoStore.extract(options),
+    async delete({ session }) {
+      // Await GridFS deletes; wwebjs-mongo's delete currently starts promises
+      // without awaiting them, which can race a relink or deployment shutdown.
+      const bucket = new mongooseInstance.mongo.GridFSBucket(mongooseInstance.connection.db, {
+        bucketName: `whatsapp-${session}`,
+      });
+      const files = await bucket.find({ filename: `${session}.zip` }).toArray();
+      await Promise.all(files.map((file) => bucket.delete(file._id)));
+    },
+  };
+}
+
 export function createWhatsAppWebSessionManager({
   env = process.env,
   dataPath = env.WHATSAPP_WEB_DATA_PATH || path.resolve(process.cwd(), '.wwebjs_auth'),
-  clientFactory = async ({ clientId, dataPath: authPath }) => {
+  remoteStore,
+  clientFactory = async ({ clientId, dataPath: authPath, shopId }) => {
     const webVersion = String(env.WHATSAPP_WEB_VERSION || DEFAULT_WEB_VERSION).trim();
     const webVersionArchive = String(env.WHATSAPP_WEB_VERSION_ARCHIVE || DEFAULT_WEB_VERSION_ARCHIVE).trim();
     const webVersionCachePath = await prepareWhatsAppWebVersion({
@@ -64,7 +102,12 @@ export function createWhatsAppWebSessionManager({
       archiveTemplate: webVersionArchive,
     });
     const client = new Client({
-      authStrategy: new LocalAuth({ clientId, dataPath: authPath }),
+      authStrategy: new RemoteAuth({
+        clientId,
+        dataPath: authPath,
+        store: sessionStore,
+        backupSyncIntervalMs: 300000,
+      }),
       webVersion,
       webVersionCache: { type: 'local', path: webVersionCachePath, strict: true },
       // The library's default UA is Chrome 101 on macOS. WhatsApp now serves a
@@ -87,6 +130,15 @@ export function createWhatsAppWebSessionManager({
         ],
       },
     });
+    const storeRemoteSession = client.authStrategy.storeRemoteSession.bind(client.authStrategy);
+    client.authStrategy.storeRemoteSession = async (options) => {
+      try {
+        return await storeRemoteSession(options);
+      } catch (error) {
+        console.error(`[WhatsApp Mongo session backup] ${shopId}: ${error?.message || 'Unknown backup failure'}`);
+        return false;
+      }
+    };
     const inject = client.inject.bind(client);
     client.inject = async () => {
       for (let attempt = 0; ; attempt += 1) {
@@ -105,20 +157,28 @@ export function createWhatsAppWebSessionManager({
   const sessions = new Map();
   const invoiceSends = new Map();
   const rootPath = path.resolve(dataPath);
+  const sessionStore = remoteStore || createMongoSessionStore(mongoose, rootPath);
 
   const isEnabled = () => truthy(env.WHATSAPP_WEB_ENABLED);
-  const sessionPath = (shopId) => path.join(rootPath, `session-${shopSessionId(shopId)}`);
+  const sessionPath = (shopId) => path.join(rootPath, remoteSessionName(shopId));
 
   async function removeSavedProfile(shopId) {
-    const profilePath = sessionPath(shopId);
+    const clientId = shopSessionId(shopId);
+    const session = remoteSessionName(shopId);
+    await sessionStore.delete({ session });
+    const paths = [
+      sessionPath(shopId),
+      path.join(rootPath, `${session}.zip`),
+      path.join(rootPath, `wwebjs_temp_session_${clientId}`),
+    ];
     let lastError;
     for (let attempt = 0; attempt < 4; attempt += 1) {
       try {
-        await fs.rm(profilePath, { recursive: true, force: true, maxRetries: 2, retryDelay: 250 });
-        await fs.access(profilePath).then(
-          () => { throw new Error('The old WhatsApp profile is still present.'); },
+        await Promise.all(paths.map((profilePath) => fs.rm(profilePath, { recursive: true, force: true, maxRetries: 2, retryDelay: 250 })));
+        await Promise.all(paths.map((profilePath) => fs.access(profilePath).then(
+          () => { throw new Error(`The old WhatsApp profile is still present at ${profilePath}.`); },
           (error) => { if (error?.code !== 'ENOENT') throw error; },
-        );
+        )));
         return;
       } catch (error) {
         lastError = error;
@@ -130,18 +190,19 @@ export function createWhatsAppWebSessionManager({
 
   function publicStatus(shopId, entry = sessions.get(String(shopId))) {
     if (!isEnabled()) return { enabled: false, status: 'disabled', connected: false, phoneNumber: '', qrDataUrl: '' };
-    if (!entry) return { enabled: true, status: 'disconnected', connected: false, phoneNumber: '', qrDataUrl: '' };
+    if (!entry) return { enabled: true, status: 'disconnected', connected: false, phoneNumber: '', qrDataUrl: '', sessionPersisted: false };
     return {
       enabled: true,
       status: entry.status,
       connected: entry.status === 'connected',
       phoneNumber: entry.phoneNumber || '',
       qrDataUrl: entry.status === 'qr' ? entry.qrDataUrl || '' : '',
+      sessionPersisted: Boolean(entry.remoteSessionSaved),
       error: entry.status === 'error' ? entry.error || 'WhatsApp could not start.' : '',
     };
   }
 
-  function startClient(shopId) {
+  function startClient(shopId, { remoteSessionSaved = false } = {}) {
     const id = String(shopId);
     const existing = sessions.get(id);
     if (existing) return existing;
@@ -152,6 +213,7 @@ export function createWhatsAppWebSessionManager({
       phoneNumber: '',
       qrDataUrl: '',
       latestQr: '',
+      remoteSessionSaved,
       error: '',
       client: null,
       disconnecting: false,
@@ -202,6 +264,10 @@ export function createWhatsAppWebSessionManager({
             entry.error = '';
             entry.phoneNumber = String(client.info?.wid?.user || '');
           });
+          client.on('remote_session_saved', () => {
+            if (entry.disconnecting || entry.client !== client) return;
+            entry.remoteSessionSaved = true;
+          });
           client.on('auth_failure', () => {
             if (entry.disconnecting || entry.client !== client) return;
             entry.status = 'error';
@@ -234,7 +300,7 @@ export function createWhatsAppWebSessionManager({
             entry.error = '';
             if (attempt === 1 && !profileReset) {
               try {
-                await fs.rm(sessionPath(id), { recursive: true, force: true });
+                await removeSavedProfile(id);
                 profileReset = true;
               } catch (resetError) {
                 entry.status = 'error';
@@ -265,12 +331,8 @@ export function createWhatsAppWebSessionManager({
     const id = String(shopId || '');
     let entry = sessions.get(id);
     if (!entry) {
-      try {
-        await fs.access(sessionPath(id));
-        entry = startClient(id); // Restore a previously linked LocalAuth session lazily.
-      } catch {
-        return publicStatus(id);
-      }
+      if (!await sessionStore.sessionExists({ session: remoteSessionName(id) })) return publicStatus(id);
+      entry = startClient(id, { remoteSessionSaved: true }); // Restore a previously linked RemoteAuth session lazily.
     }
     return publicStatus(id, entry);
   }
@@ -284,7 +346,7 @@ export function createWhatsAppWebSessionManager({
       try { await previous.client?.destroy(); } catch { /* Profile cleanup below verifies whether the browser released it. */ }
       sessions.delete(id);
       // An explicit Link action from the owner is the recovery action for a
-      // failed restore. Always discard that failed LocalAuth profile so the
+      // failed restore. Always discard that failed remote profile so the
       // new client can emit a genuine first-pairing QR instead of reopening it.
       await removeSavedProfile(id);
     }
@@ -309,7 +371,7 @@ export function createWhatsAppWebSessionManager({
       }
       sessions.delete(id);
     }
-    await fs.rm(sessionPath(id), { recursive: true, force: true });
+    await removeSavedProfile(id);
     return publicStatus(id);
   }
 
@@ -362,8 +424,8 @@ export function createWhatsAppWebSessionManager({
     let restored = 0;
     for (const shopId of shopIds) {
       try {
-        await fs.access(sessionPath(shopId));
-        startClient(shopId);
+        if (!await sessionStore.sessionExists({ session: remoteSessionName(shopId) })) continue;
+        startClient(shopId, { remoteSessionSaved: true });
         restored += 1;
       } catch {
         // No saved session for this shop.
@@ -375,7 +437,7 @@ export function createWhatsAppWebSessionManager({
   async function shutdown() {
     for (const entry of sessions.values()) {
       entry.disconnecting = true;
-      try { await entry.client?.destroy(); } catch { /* Preserve LocalAuth data while closing browser clients. */ }
+      try { await entry.client?.destroy(); } catch { /* Preserve the MongoDB session while closing browser clients. */ }
     }
     sessions.clear();
   }
@@ -389,6 +451,7 @@ export function createWhatsAppWebSessionManager({
     restorePersistedSessions,
     shutdown,
     sessionPath,
+    remoteSessionName,
     isEnabled,
   };
 }

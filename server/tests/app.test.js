@@ -1121,7 +1121,7 @@ test('WhatsApp invoice connection is owner-only, shop-isolated, validates the sa
   }
 });
 
-test('WhatsApp Web session manager restores a shop LocalAuth session and sends a PDF document through a mocked client', async () => {
+test('WhatsApp Web session manager restores a shop RemoteAuth session and sends a PDF document through a mocked client', async () => {
   const { EventEmitter } = await import('node:events');
   const fs = await import('node:fs/promises');
   const os = await import('node:os');
@@ -1131,6 +1131,13 @@ test('WhatsApp Web session manager restores a shop LocalAuth session and sends a
   const env = { WHATSAPP_WEB_ENABLED: 'true' };
   let initializedClients = 0;
   let sentDocument = null;
+  const storedSessions = new Set();
+  const remoteStore = {
+    sessionExists: async ({ session }) => storedSessions.has(session),
+    save: async ({ session }) => { storedSessions.add(session); },
+    extract: async () => {},
+    delete: async ({ session }) => { storedSessions.delete(session); },
+  };
   const clientFactory = async () => {
     const client = new EventEmitter();
     client.info = { wid: { user: '923001234567' } };
@@ -1145,9 +1152,9 @@ test('WhatsApp Web session manager restores a shop LocalAuth session and sends a
     return client;
   };
   try {
-    const firstRun = createWhatsAppWebSessionManager({ env, dataPath, clientFactory, messageMediaFactory: (mimetype, data, filename) => ({ mimetype, data, filename }) });
-    await fs.mkdir(firstRun.sessionPath('tenant-one'), { recursive: true });
-    const restartedRun = createWhatsAppWebSessionManager({ env, dataPath, clientFactory, messageMediaFactory: (mimetype, data, filename) => ({ mimetype, data, filename }) });
+    const firstRun = createWhatsAppWebSessionManager({ env, dataPath, remoteStore, clientFactory, messageMediaFactory: (mimetype, data, filename) => ({ mimetype, data, filename }) });
+    storedSessions.add(firstRun.remoteSessionName('tenant-one'));
+    const restartedRun = createWhatsAppWebSessionManager({ env, dataPath, remoteStore, clientFactory, messageMediaFactory: (mimetype, data, filename) => ({ mimetype, data, filename }) });
     assert.equal(await restartedRun.restorePersistedSessions(['tenant-one', 'tenant-two']), 1);
     assert.equal(initializedClients, 1, 'a saved shop session is restored but a tenant without a saved directory is not started');
     assert.equal((await restartedRun.getStatus('tenant-one')).connected, true);
@@ -1163,6 +1170,8 @@ test('WhatsApp Web session manager restores a shop LocalAuth session and sends a
     assert.equal(Buffer.from(sentDocument.media.data, 'base64').toString(), '%PDF mock invoice');
     assert.equal(sentDocument.options.sendMediaAsDocument, true);
     assert.equal(sentDocument.options.caption, 'Invoice');
+    await restartedRun.disconnect('tenant-one');
+    assert.equal(storedSessions.has(restartedRun.remoteSessionName('tenant-one')), false, 'disconnect deletes only this tenant’s remote session');
   } finally {
     await fs.rm(dataPath, { recursive: true, force: true });
   }
@@ -1237,6 +1246,12 @@ test('WhatsApp Web Link clears a failed saved profile before starting a fresh pa
   const { createWhatsAppWebSessionManager } = await import('../services/whatsappWebSessions.js');
   const dataPath = await fs.mkdtemp(path.join(os.tmpdir(), 'electrohub-wa-link-reset-test-'));
   const env = { WHATSAPP_WEB_ENABLED: 'true' };
+  const remoteStore = {
+    sessionExists: async () => false,
+    save: async () => {},
+    extract: async () => {},
+    delete: async () => {},
+  };
   let created = 0;
   let destroyed = 0;
   const clientFactory = async () => {
@@ -1252,6 +1267,7 @@ test('WhatsApp Web Link clears a failed saved profile before starting a fresh pa
   const manager = createWhatsAppWebSessionManager({
     env,
     dataPath,
+    remoteStore,
     clientFactory,
     qrEncoder: async () => 'data:image/png;base64,bW9jay1xci==',
   });
@@ -1283,6 +1299,12 @@ test('WhatsApp Web session manager clears a repeatedly failing profile and creat
   const { createWhatsAppWebSessionManager } = await import('../services/whatsappWebSessions.js');
   const dataPath = await fs.mkdtemp(path.join(os.tmpdir(), 'electrohub-wa-stale-session-test-'));
   const env = { WHATSAPP_WEB_ENABLED: 'true' };
+  const remoteStore = {
+    sessionExists: async () => false,
+    save: async () => {},
+    extract: async () => {},
+    delete: async () => {},
+  };
   let created = 0;
   const clientFactory = async () => {
     const client = new EventEmitter();
@@ -1296,7 +1318,7 @@ test('WhatsApp Web session manager clears a repeatedly failing profile and creat
     return client;
   };
   const manager = createWhatsAppWebSessionManager({
-    env, dataPath, clientFactory,
+    env, dataPath, remoteStore, clientFactory,
     qrEncoder: async () => 'data:image/png;base64,bW9jay1xci==',
   });
   try {
