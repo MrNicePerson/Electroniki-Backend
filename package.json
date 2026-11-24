@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "node --watch server/index.js",
     "start": "node server/index.js",
-    "test": "node --test server/tests/app.test.js"
+    "test": "node --test server/tests/app.test.js",
+    "postinstall": "npx puppeteer browsers install chrome"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

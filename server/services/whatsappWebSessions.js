@@ -72,7 +72,19 @@ export function createWhatsAppWebSessionManager({
       userAgent: false,
       puppeteer: {
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        ...(String(env.PUPPETEER_EXECUTABLE_PATH || '').trim()
+          ? { executablePath: String(env.PUPPETEER_EXECUTABLE_PATH).trim() }
+          : {}),
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--single-process',
+          '--disable-gpu',
+        ],
       },
     });
     const inject = client.inject.bind(client);
@@ -139,6 +151,7 @@ export function createWhatsAppWebSessionManager({
       status: 'starting',
       phoneNumber: '',
       qrDataUrl: '',
+      latestQr: '',
       error: '',
       client: null,
       disconnecting: false,
@@ -159,13 +172,17 @@ export function createWhatsAppWebSessionManager({
           entry.client = client;
           client.on('qr', async (qr) => {
             if (entry.disconnecting || entry.client !== client) return;
+            entry.latestQr = qr;
+            entry.qrDataUrl = '';
+            entry.status = 'starting';
             try {
-              entry.qrDataUrl = await qrEncoder(qr);
-              if (entry.disconnecting || entry.client !== client) return;
+              const qrDataUrl = await qrEncoder(qr);
+              if (entry.disconnecting || entry.client !== client || entry.latestQr !== qr) return;
+              entry.qrDataUrl = qrDataUrl;
               entry.status = 'qr';
               entry.error = '';
             } catch {
-              if (entry.client !== client) return;
+              if (entry.disconnecting || entry.client !== client || entry.latestQr !== qr) return;
               entry.status = 'error';
               entry.error = 'Could not create a WhatsApp link QR code.';
             }
@@ -174,12 +191,14 @@ export function createWhatsAppWebSessionManager({
             if (entry.disconnecting || entry.client !== client) return;
             entry.status = 'authenticated';
             entry.qrDataUrl = '';
+            entry.latestQr = '';
             entry.error = '';
           });
           client.on('ready', () => {
             if (entry.disconnecting || entry.client !== client) return;
             entry.status = 'connected';
             entry.qrDataUrl = '';
+            entry.latestQr = '';
             entry.error = '';
             entry.phoneNumber = String(client.info?.wid?.user || '');
           });
@@ -188,6 +207,7 @@ export function createWhatsAppWebSessionManager({
             entry.status = 'error';
             entry.needsFreshSession = true;
             entry.qrDataUrl = '';
+            entry.latestQr = '';
             entry.error = 'WhatsApp authentication expired. Click Link WhatsApp to reset the saved session and create a fresh QR code.';
           });
           client.on('disconnected', (reason) => {
@@ -196,6 +216,7 @@ export function createWhatsAppWebSessionManager({
             entry.needsFreshSession = /logout/i.test(String(reason || ''));
             entry.phoneNumber = '';
             entry.qrDataUrl = '';
+            entry.latestQr = '';
             entry.error = String(reason || 'WhatsApp device disconnected.');
           });
           await client.initialize();

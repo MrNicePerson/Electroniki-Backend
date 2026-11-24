@@ -1085,7 +1085,7 @@ test('WhatsApp invoice connection is owner-only, shop-isolated, validates the sa
     assert.equal(sale.data.sale.whatsapp, '+92 300 7654321', 'the saved WhatsApp is retained when it differs from the phone');
 
     const pdfDataUrl = 'data:application/pdf;base64,JVBERi0xLjQKJQ==';
-    const payload = { invoiceNo: sale.data.sale.invoiceNo, to: '00923007654321', fileName: 'invoice-test.pdf', pdfDataUrl, caption: 'Invoice attached' };
+    const payload = { invoiceNo: sale.data.sale.invoiceNo, to: '++92 300 7654321', fileName: 'invoice-test.pdf', pdfDataUrl, caption: 'Invoice attached' };
     const wrongCustomerNumber = await api('/whatsapp/invoice-document', { method: 'POST', token: staffToken, body: { ...payload, to: '03001111111' } });
     assert.equal(wrongCustomerNumber.status, 400, 'recipient must match the invoice WhatsApp, not its phone fallback');
     const crossShop = await api('/whatsapp/invoice-document', { method: 'POST', token: otherOwnerToken, body: payload });
@@ -1198,6 +1198,35 @@ test('WhatsApp Web session manager retries a transient destroyed browser context
   assert.equal(destroyed, 1, 'the failed browser client is closed before retrying');
   assert.equal(status.status, 'qr');
   assert.equal(status.qrDataUrl, 'data:image/png;base64,bW9jay1xci==');
+});
+
+test('WhatsApp Web session manager exposes the newest QR when QR encoding finishes out of order', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { createWhatsAppWebSessionManager } = await import('../services/whatsappWebSessions.js');
+  const client = new EventEmitter();
+  client.initialize = async () => {
+    client.emit('qr', 'old-qr');
+    client.emit('qr', 'latest-qr');
+  };
+  client.destroy = async () => {};
+  let finishOldQr;
+  const manager = createWhatsAppWebSessionManager({
+    env: { WHATSAPP_WEB_ENABLED: 'true' },
+    dataPath: 'mock-whatsapp-latest-qr-data',
+    clientFactory: async () => client,
+    qrEncoder: async (value) => value === 'old-qr'
+      ? new Promise((resolve) => { finishOldQr = resolve; })
+      : 'data:image/png;base64,bGF0ZXN0',
+  });
+
+  await manager.link('latest-qr-shop');
+  await new Promise((resolve) => setImmediate(resolve));
+  finishOldQr('data:image/png;base64,b2xk');
+  await new Promise((resolve) => setImmediate(resolve));
+  const status = await manager.getStatus('latest-qr-shop');
+  assert.equal(status.status, 'qr');
+  assert.equal(status.qrDataUrl, 'data:image/png;base64,bGF0ZXN0');
+  await manager.shutdown();
 });
 
 test('WhatsApp Web Link clears a failed saved profile before starting a fresh pairing', async () => {
