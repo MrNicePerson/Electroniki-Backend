@@ -1100,10 +1100,10 @@ test('WhatsApp invoice connection is owner-only, shop-isolated, validates the sa
     assert.equal(sends[0].pdf.toString('ascii').startsWith('%PDF'), true);
 
     const savedInvoice = await db.Sale.findOne({ invoiceNo: sale.data.sale.invoiceNo, shopId: first.data.shop.id });
-    await db.Sale.updateOne({ _id: savedInvoice.id, shopId: first.data.shop.id }, { whatsapp: '' });
+    await db.Sale.updateOne({ _id: savedInvoice.id, shopId: first.data.shop.id }, { whatsapp: 'invalid WhatsApp value' });
     const phoneFallback = await api('/whatsapp/invoice-document', { method: 'POST', token: staffToken, body: { ...payload, to: '+92 300 1111111' } });
     assert.equal(phoneFallback.status, 200, phoneFallback.data.error);
-    assert.equal(sends[1].to, '923001111111', 'the saved invoice phone is used only when WhatsApp is blank');
+    assert.equal(sends[1].to, '923001111111', 'the saved invoice phone is used when WhatsApp is blank or invalid');
     failNextSend = true;
     const failedSend = await api('/whatsapp/invoice-document', { method: 'POST', token: staffToken, body: { ...payload, to: '03001111111' } });
     assert.equal(failedSend.status, 502);

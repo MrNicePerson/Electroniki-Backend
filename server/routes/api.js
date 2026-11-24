@@ -444,7 +444,7 @@ apiRouter.post('/whatsapp/invoice-document', async (req, res) => {
   try {
     const invoice = await db.Sale.findOne({ invoiceNo: String(invoiceNo || '').trim(), shopId: req.shopId });
     if (!invoice) return res.status(404).json({ error: 'This invoice was not found in your shop.' });
-    const savedCustomerNumber = normalizeWhatsAppNumber(invoice.whatsapp || invoice.phone);
+    const savedCustomerNumber = normalizeWhatsAppNumber(invoice.whatsapp) || normalizeWhatsAppNumber(invoice.phone);
     if (!savedCustomerNumber || savedCustomerNumber !== normalizeWhatsAppNumber(to)) {
       return res.status(400).json({ error: 'The recipient must match the WhatsApp number saved on this invoice.' });
     }
