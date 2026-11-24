@@ -47,19 +47,18 @@ Open <http://localhost:5173>. The Vite dev server forwards `/api` requests to th
 
 ## Environment variables and optional integrations
 
-`server/index.js` loads `backend/.env` through `dotenv/config`. MongoDB URI and JWT secret are required. The Super Admin assigns a separate Gemini API key to each shop during shop creation and can rotate or remove it from Invoice design. Shop keys are encrypted at rest using `SHOP_SECRET_ENCRYPTION_KEY`; if it is not set, the backend derives the encryption key from `JWT_SECRET`. Keep the selected encryption secret stable after keys are saved. Without a shop Gemini key, supplier invoice details can be entered manually. SMTP password-reset email and WhatsApp Cloud API credentials are optional. WhatsApp automation also needs approved Meta message templates and recipients configured in the shop settings.
+`server/index.js` loads `backend/.env` through `dotenv/config`. MongoDB URI and JWT secret are required. The Super Admin assigns a separate Gemini API key to each shop during shop creation and can rotate or remove it from Invoice design. Shop keys are encrypted at rest using `SHOP_SECRET_ENCRYPTION_KEY`; if it is not set, the backend derives the encryption key from `JWT_SECRET`. SMTP password-reset email is optional. WhatsApp uses a QR-linked Baileys session persisted in the existing MongoDB database; it does not need Meta Cloud API credentials, Puppeteer, Chromium, or a Render disk.
 
-### QR-linked WhatsApp invoice PDFs (optional)
+### QR-linked WhatsApp (optional)
 
-Invoice PDFs can be sent as actual PDF documents through a Shop Owner's linked WhatsApp account. This is separate from the official Meta Cloud API used for installment reminders and low-stock alerts.
+Invoice PDFs, installment reminders, and low-stock alerts all use the Shop Owner's linked WhatsApp account.
 
-1. In `backend/.env`, set `WHATSAPP_WEB_ENABLED=true`. WhatsApp sessions are stored in MongoDB GridFS through `wwebjs-mongo` and `RemoteAuth`, using a separate hashed session ID for each shop. The temporary browser profile uses `WHATSAPP_WEB_DATA_PATH` (default `./.wwebjs_auth`) and does not need a persistent disk. The app pins a known-good WhatsApp Web archive build (`WHATSAPP_WEB_VERSION`) and checks that its HTML is the actual web app before caching it in `./.wwebjs_cache`; this avoids accidentally loading a logged-out landing page that cannot produce a QR. The archive URL is configurable with `WHATSAPP_WEB_VERSION_ARCHIVE`.
-2. `npm install` runs the Puppeteer postinstall command to install Chrome for Render/Linux. Set `PUPPETEER_EXECUTABLE_PATH` only when the host requires a specific browser executable; leave it blank for Render's installed Chrome.
-3. Keep the MongoDB URI available to the backend; the session archive is written to MongoDB GridFS. After first linking, RemoteAuth saves its initial backup after about one minute, then synchronizes every five minutes. Existing LocalAuth sessions are not migrated automatically, so scan a new QR once after this change. Keep one active backend instance per shop to avoid multiple WhatsApp clients using the same session.
-4. Sign in as the Shop Owner, open Settings → WhatsApp Invoice Connection, select **Link WhatsApp**, and scan the displayed QR in WhatsApp → Linked devices → Link a device. Each shop restores its own remote session at startup.
-5. Use **Disconnect** in the same owner-only Settings section to log out and delete that shop's saved MongoDB session.
+1. Keep the backend connected to MongoDB. Baileys credentials and Signal keys are serialized with `BufferJSON` and stored as per-shop `WhatsAppAuth` records; the session does not use local files or zip archives.
+2. Sign in as the Shop Owner, open Settings → **WhatsApp Connection**, select **Link WhatsApp**, and scan the QR in WhatsApp → Linked devices → Link a device. Saved sessions reconnect automatically after backend restarts.
+3. Enable installment reminders or low-stock alerts in Settings. Installment reminders require a customer number and recorded consent; low-stock alerts require two valid alert numbers. Reminders run at 8:00 AM Pakistan time and are spaced five seconds apart.
+4. Use **Disconnect** in Settings to log out and remove that shop's saved MongoDB auth records.
 
-This integration uses the unofficial `whatsapp-web.js` client and WhatsApp Web automation. It is not affiliated with or endorsed by WhatsApp, can stop working when WhatsApp changes, and may result in account restrictions. Use it only if those limitations are acceptable; the Meta Cloud API automation remains available independently. A successful send is reported only after the WhatsApp client accepts the document. The recipient is checked against the invoice stored in the active shop. See the [whatsapp-web.js project disclaimer](https://github.com/wwebjs/whatsapp-web.js#disclaimer) and its [RemoteAuth persistence documentation](https://wwebjs.dev/guide/creating-your-bot/authentication.html#remoteauth-strategy).
+Baileys connects directly over a WebSocket and does not use Puppeteer or Chromium. It is an unofficial WhatsApp Web client and may stop working if WhatsApp changes its protocol. Send messages only to recipients who have agreed to receive them. Invoice recipients are matched against the customer number saved on the invoice.
 
 ## Production
 

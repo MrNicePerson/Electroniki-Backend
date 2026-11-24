@@ -11,7 +11,7 @@ import { connectDatabase, db } from './db.js';
 import { apiRouter } from './routes/api.js';
 import { hashPassword } from './middleware/auth.js';
 import { startAutomationScheduler } from './services/automationScheduler.js';
-import { getWhatsAppWebSessionManager } from './services/whatsappWebSessions.js';
+import { whatsappService } from './services/whatsappService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -255,13 +255,7 @@ export async function startServer() {
 
 async function restoreWhatsAppSessionsSafely() {
   try {
-    const sessionManager = getWhatsAppWebSessionManager();
-    if (!sessionManager.isEnabled()) return;
-
-    const shops = await db.Shop.find({});
-    const count = await sessionManager.restorePersistedSessions(
-      shops.map((shop) => shop.id)
-    );
+    const count = await whatsappService.restoreSavedSessions();
     if (count) {
       console.log(`Restoring ${count} linked WhatsApp shop session(s).`);
     }

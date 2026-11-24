@@ -30,8 +30,8 @@ import {
   calculateShopFinancialSummary,
   calculateCashSessionTotals,
 } from '../utils/calculations.js';
-import { isWhatsAppAutomationConfigured, normalizeWhatsAppNumber, sendWhatsAppDocument } from '../utils/whatsappCloud.js';
-import { getWhatsAppWebSessionManager } from '../services/whatsappWebSessions.js';
+import { normalizeWhatsAppNumber } from '../utils/whatsappPhone.js';
+import { whatsappService } from '../services/whatsappService.js';
 import { decryptSecret, encryptSecret } from '../utils/secrets.js';
 
 export const apiRouter = express.Router();
@@ -407,14 +407,14 @@ apiRouter.post('/auth/reset-password', async (req, res) => {
 apiRouter.use(requireAuth);
 
 apiRouter.get('/whatsapp/connection/status', requireOwner, async (req, res) => {
-  const status = await getWhatsAppWebSessionManager().getStatus(req.shopId);
+  const status = await whatsappService.getStatus(req.shopId);
   res.setHeader('Cache-Control', 'no-store');
   return res.json({ connection: status });
 });
 
 apiRouter.post('/whatsapp/connection/link', requireOwner, async (req, res) => {
   try {
-    const connection = await getWhatsAppWebSessionManager().link(req.shopId);
+    const connection = await whatsappService.link(req.shopId);
     res.setHeader('Cache-Control', 'no-store');
     return res.json({ connection });
   } catch (err) {
@@ -424,7 +424,7 @@ apiRouter.post('/whatsapp/connection/link', requireOwner, async (req, res) => {
 
 apiRouter.post('/whatsapp/connection/disconnect', requireOwner, async (req, res) => {
   try {
-    const connection = await getWhatsAppWebSessionManager().disconnect(req.shopId);
+    const connection = await whatsappService.disconnect(req.shopId);
     return res.json({ connection });
   } catch (err) {
     return res.status(500).json({ error: 'Could not disconnect this shop WhatsApp session.' });
@@ -450,20 +450,17 @@ apiRouter.post('/whatsapp/invoice-document', async (req, res) => {
     }
     const encodedPdf = String(pdfDataUrl).split(',')[1].replace(/\s/g, '');
     const pdf = Buffer.from(encodedPdf, 'base64');
-    const webSessions = getWhatsAppWebSessionManager();
-    const result = webSessions.isEnabled()
-      ? await webSessions.sendInvoiceDocument({
-        shopId: req.shopId,
-        invoiceNo: invoice.invoiceNo,
-        to: savedCustomerNumber,
-        fileName,
-        pdf,
-        caption,
-      })
-      : await sendWhatsAppDocument({ to: savedCustomerNumber, fileName, pdf, caption });
+    const result = await whatsappService.sendInvoiceDocument({
+      shopId: req.shopId,
+      invoiceNo: invoice.invoiceNo,
+      to: savedCustomerNumber,
+      fileName,
+      pdf,
+      caption: caption || `Invoice ${invoice.invoiceNo} from ${req.shop.name}`,
+    });
     return res.json({ ok: true, messageId: result?.messageId || result?.messages?.[0]?.id || null, duplicate: Boolean(result?.duplicate) });
   } catch (err) {
-    const status = /not configured|disabled|no linked|not ready/i.test(err.message) ? 503
+    const status = /not configured|disabled|no linked|not ready|not linked/i.test(err.message) ? 503
       : /invalid|missing|must be/i.test(err.message) ? 400 : 502;
     return res.status(status).json({ error: err.message || 'Could not send the invoice PDF through WhatsApp.' });
   }
@@ -851,7 +848,7 @@ async function buildShopBootstrap(shopId, currentUser, period = 'all', date = ''
   }));
 
   return {
-    shop: shop ? { ...(shop.toObject ? shop.toObject() : shop), whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shop,
+    shop: shop ? (shop.toObject ? shop.toObject() : shop) : shop,
     user: currentUser,
     users,
     products,
@@ -901,7 +898,7 @@ apiRouter.get('/settings', async (req, res) => {
   }));
   const shopData = shop?.toObject ? shop.toObject() : shop;
   if (shopData) delete shopData.geminiApiKeyEncrypted;
-  return res.json({ shop: shopData ? { ...shopData, whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shopData, users });
+  return res.json({ shop: shopData, users });
 });
 
 apiRouter.put('/settings', requireOwner, async (req, res) => {
@@ -944,7 +941,12 @@ apiRouter.put('/settings', requireOwner, async (req, res) => {
           ? Boolean(req.shop.automation?.lowStockAlertsEnabled)
           : Boolean(automation.lowStockAlertsEnabled),
         lowStockRecipients: Array.isArray(automation?.lowStockRecipients)
-          ? automation.lowStockRecipients.slice(0, 2).map((value) => String(value || '').trim())
+          ? [...new Set(automation.lowStockRecipients.slice(0, 2).map((value) => {
+            const rawValue = String(value || '').trim();
+            const normalized = normalizeWhatsAppNumber(rawValue);
+            if (rawValue && !normalized) throw Object.assign(new Error('Enter valid WhatsApp numbers for both low-stock alert recipients.'), { status: 400 });
+            return normalized;
+          }).filter(Boolean))]
           : (req.shop.automation?.lowStockRecipients || []),
       },
     };
@@ -961,9 +963,9 @@ apiRouter.put('/settings', requireOwner, async (req, res) => {
 
     const shopData = updated?.toObject ? updated.toObject() : updated;
     if (shopData) delete shopData.geminiApiKeyEncrypted;
-    return res.json({ shop: shopData ? { ...shopData, whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shopData });
+    return res.json({ shop: shopData });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to update shop settings.' });
+    return res.status(err.status || 500).json({ error: err.status === 400 ? err.message : 'Failed to update shop settings.' });
   }
 });
 

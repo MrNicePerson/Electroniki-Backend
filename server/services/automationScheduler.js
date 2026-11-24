@@ -1,13 +1,11 @@
 import mongoose from 'mongoose';
 import { db } from '../db.js';
-import {
-  getWhatsAppAutomationConfig,
-  isWhatsAppAutomationConfigured,
-  normalizeWhatsAppNumber,
-  sendWhatsAppTemplate,
-} from '../utils/whatsappCloud.js';
+import { normalizeWhatsAppNumber } from '../utils/whatsappPhone.js';
+import { whatsappService } from './whatsappService.js';
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
+const REMINDER_MESSAGE_DELAY_MS = 5 * 1000;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let schedulerTimer = null;
 let cycleRunning = false;
 
@@ -32,32 +30,32 @@ async function resetRecoveredStockAlerts(shopId, products) {
     const threshold = Number(product.reorderThreshold ?? 5);
     const recovered = Number(product.stock || 0) > threshold;
     if (recovered && product.lowStockNotifiedRecipients?.length) {
-      await db.Product.updateOne(
-        { _id: product.id, shopId },
-        { lowStockNotifiedRecipients: [] }
-      );
+      await db.Product.updateOne({ _id: product.id, shopId }, { lowStockNotifiedRecipients: [] });
     }
   }
 }
 
-async function processLowStockAlerts(shop, products, configReady) {
+async function processLowStockAlerts(shop, products) {
   const automation = shop.automation || {};
   const recipients = normalizedRecipients(automation.lowStockRecipients || []);
-  if (!automation.lowStockAlertsEnabled || !configReady || recipients.length !== 2) return;
+  if (!automation.lowStockAlertsEnabled || recipients.length !== 2) return;
 
-  const config = getWhatsAppAutomationConfig();
   for (const product of products) {
     const threshold = Number(product.reorderThreshold ?? 5);
-    if (Number(product.stock || 0) > threshold) continue;
+    const stock = Number(product.stock || 0);
+    if (stock > threshold) continue;
     const alreadyNotified = (product.lowStockNotifiedRecipients || []).map(normalizeWhatsAppNumber);
     for (const recipient of recipients) {
       if (alreadyNotified.includes(recipient)) continue;
+      const message = [
+        `Low stock alert — ${shop.name}`,
+        `Product: ${product.name}${product.code ? ` (${product.code})` : ''}`,
+        `Current stock: ${stock}`,
+        `Reorder threshold: ${threshold}`,
+        'Please arrange restocking.',
+      ].join('\n');
       try {
-        await sendWhatsAppTemplate({
-          to: recipient,
-          templateName: config.lowStockTemplate,
-          parameters: [shop.name, product.name, product.code, product.stock || 0, threshold],
-        });
+        await whatsappService.sendTextMessage({ shopId: shop.id, to: recipient, text: message });
         alreadyNotified.push(recipient);
         await db.Product.updateOne(
           { _id: product.id, shopId: shop.id },
@@ -70,29 +68,30 @@ async function processLowStockAlerts(shop, products, configReady) {
   }
 }
 
-async function processInstallmentReminders(shop, plans, paidPlanIdsThisMonth, dateKey, monthKey, hour, configReady) {
-  const automation = shop.automation || {};
-  if (!automation.installmentRemindersEnabled || !configReady) return;
-  const config = getWhatsAppAutomationConfig();
+async function processInstallmentReminders(shop, plans, paidPlanIdsThisMonth, dateKey, monthKey, hour) {
+  if (!shop.automation?.installmentRemindersEnabled) return;
+  let attempted = 0;
 
   for (const plan of plans) {
     if (!shouldSendInstallmentReminder(plan, dateKey, monthKey, hour, paidPlanIdsThisMonth.has(String(plan.id)))) continue;
-
     const recipient = normalizeWhatsAppNumber(plan.whatsapp || plan.phone);
     if (!recipient) continue;
+    if (attempted > 0) await sleep(REMINDER_MESSAGE_DELAY_MS);
+    attempted += 1;
+
+    const customerName = String(plan.customerName || 'Customer').trim();
+    const dueAmount = Number(plan.monthlyAmount || plan.balance || 0).toLocaleString('en-PK');
+    const remainingBalance = Number(plan.balance || 0).toLocaleString('en-PK');
+    const message = [
+      `Assalam-o-Alaikum ${customerName},`,
+      `Aapki ${shop.name} installment qist Rs. ${dueAmount} ki due date ${plan.nextDueDate} hai.`,
+      `Baqaya balance: Rs. ${remainingBalance}.`,
+      'Meherbani karke payment jama karwa dein. Agar aap payment kar chuke hain to is paigham ko nazar-andaz karein.',
+      `Thank you — ${shop.name}`,
+    ].join('\n');
+
     try {
-      await sendWhatsAppTemplate({
-        to: recipient,
-        templateName: config.installmentTemplate,
-        parameters: [
-          plan.customerName,
-          plan.planNo || plan.invoiceNo,
-          plan.monthlyAmount || plan.balance,
-          plan.nextDueDate,
-          plan.balance,
-          shop.name,
-        ],
-      });
+      await whatsappService.sendTextMessage({ shopId: shop.id, to: recipient, text: message });
       await db.InstallmentPlan.updateOne(
         { _id: plan.id, shopId: shop.id },
         { lastWhatsAppReminderDate: dateKey, lastWhatsAppReminderMonth: monthKey }
@@ -109,7 +108,7 @@ export function shouldSendInstallmentReminder(plan, dateKey, monthKey, hour, pay
   if (Number(plan.balance || 0) <= 0 || !plan.whatsappReminderEnabled || !plan.whatsappReminderConsent) return false;
   if (!plan.nextDueDate || plan.nextDueDate === 'Completed' || plan.nextDueDate > dateKey) return false;
   if (plan.lastWhatsAppReminderDate === dateKey) return false;
-    if (plan.lastInstallmentPaymentAt) {
+  if (plan.lastInstallmentPaymentAt) {
     const paymentDate = pakistanDateParts(new Date(plan.lastInstallmentPaymentAt));
     if (`${paymentDate.year}-${paymentDate.month}` === monthKey) return false;
   }
@@ -117,17 +116,13 @@ export function shouldSendInstallmentReminder(plan, dateKey, monthKey, hour, pay
 }
 
 export async function runAutomationCycle(now = new Date()) {
-  // Skip scheduled work while MongoDB is disconnected or reconnecting. This
-  // also avoids querying through a session that startup cleanup has ended.
-  if (mongoose.connection.readyState !== 1) return;
-  if (cycleRunning) return;
+  if (mongoose.connection.readyState !== 1 || cycleRunning) return;
   cycleRunning = true;
   try {
     const { year, month, day, hour } = pakistanDateParts(now);
     const dateKey = `${year}-${month}-${day}`;
     const monthKey = `${year}-${month}`;
     const shops = await db.Shop.find({});
-    const configReady = isWhatsAppAutomationConfigured();
 
     for (const shop of shops) {
       const [products, plans, payments] = await Promise.all([
@@ -142,8 +137,8 @@ export async function runAutomationCycle(now = new Date()) {
         })())
         .map((payment) => String(payment.planId)));
       await resetRecoveredStockAlerts(shop.id, products);
-      await processLowStockAlerts(shop, products, configReady);
-      await processInstallmentReminders(shop, plans, paidPlanIdsThisMonth, dateKey, monthKey, hour, configReady);
+      await processLowStockAlerts(shop, products);
+      await processInstallmentReminders(shop, plans, paidPlanIdsThisMonth, dateKey, monthKey, hour);
     }
   } finally {
     cycleRunning = false;
