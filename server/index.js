@@ -1,6 +1,7 @@
 
 import 'dotenv/config';
 import express from 'express';
+import cors from 'cors';
 import mongoose from 'mongoose';
 import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
@@ -38,8 +39,44 @@ for (const value of configuredOrigins) {
   }
 }
 
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin) return callback(null, false);
+    try {
+      return callback(null, allowedOrigins.has(new URL(origin).origin));
+    } catch {
+      return callback(null, false);
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  preflightContinue: true,
+  optionsSuccessStatus: 204,
+};
+
 export function createApp() {
   const app = express();
+
+  // CORS must run before routes, auth checks, and other middleware so errors
+  // and preflight responses carry the frontend's allow-origin headers.
+  app.use(cors(corsOptions));
+  app.use((req, res, next) => {
+    if (req.method !== 'OPTIONS' || !req.get('Origin')) return next();
+
+    try {
+      const origin = new URL(req.get('Origin'));
+      const isSameOrigin = origin.host.toLowerCase() === String(req.get('Host') || '').toLowerCase();
+      if (!['http:', 'https:'].includes(origin.protocol) || (!isSameOrigin && !allowedOrigins.has(origin.origin))) {
+        return res.status(403).json({ error: 'Cross-origin requests are not allowed.' });
+      }
+    } catch {
+      return res.status(403).json({ error: 'Invalid request origin.' });
+    }
+
+    return next();
+  });
+  app.options('*', cors({ ...corsOptions, preflightContinue: false }));
 
   app.disable('x-powered-by');
 
@@ -64,70 +101,6 @@ export function createApp() {
       status: 'healthy',
       timestamp: new Date().toISOString(),
     });
-  });
-
-  // CORS configuration for the Vercel frontend and local development.
-  app.use((req, res, next) => {
-    const origin = req.get('Origin');
-
-    if (!origin) {
-      return next();
-    }
-
-    let parsedOrigin;
-
-    try {
-      parsedOrigin = new URL(origin);
-    } catch {
-      return res.status(403).json({
-        error: 'Invalid request origin.',
-      });
-    }
-
-    if (!['http:', 'https:'].includes(parsedOrigin.protocol)) {
-      return res.status(403).json({
-        error: 'Invalid request protocol.',
-      });
-    }
-
-    const normalizedOrigin = parsedOrigin.origin;
-    const requestHost = String(req.get('Host') || '').toLowerCase();
-
-    // Allow either the same origin or an explicitly trusted frontend.
-    const isSameOrigin =
-      parsedOrigin.host.toLowerCase() === requestHost;
-
-    const isAllowedOrigin =
-      isSameOrigin || allowedOrigins.has(normalizedOrigin);
-
-    if (!isAllowedOrigin) {
-      if (req.method === 'OPTIONS') {
-        return res.status(403).json({
-          error: 'Cross-origin requests are not allowed.',
-        });
-      }
-
-      return next();
-    }
-
-    res.setHeader('Access-Control-Allow-Origin', normalizedOrigin);
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader(
-      'Access-Control-Allow-Methods',
-      'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS'
-    );
-    res.setHeader(
-      'Access-Control-Allow-Headers',
-      'Content-Type, Authorization'
-    );
-    res.setHeader('Vary', 'Origin');
-
-    // Handle browser CORS preflight requests.
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(204);
-    }
-
-    next();
   });
 
   // Reject state-changing requests from untrusted origins.
@@ -247,29 +220,9 @@ export async function startServer() {
       ]);
 
       startAutomationScheduler();
-
-      if (getWhatsAppWebSessionManager().isEnabled()) {
-        // Restore persisted WhatsApp sessions in the background.
-        db.Shop.find({})
-          .then((shops) =>
-            getWhatsAppWebSessionManager().restorePersistedSessions(
-              shops.map((shop) => shop.id)
-            )
-          )
-          .then((count) => {
-            if (count) {
-              console.log(
-                `Restoring ${count} linked WhatsApp shop session(s).`
-              );
-            }
-          })
-          .catch((error) =>
-            console.error(
-              'WhatsApp session restore failed:',
-              error?.message || error
-            )
-          );
-      }
+      // Mongoose has connected before startServer reaches this callback.
+      // Keep WhatsApp/RemoteAuth failures isolated from the HTTP server startup.
+      void restoreWhatsAppSessionsSafely();
 
       resolve(server);
     });
@@ -286,6 +239,23 @@ export async function startServer() {
       }
     });
   });
+}
+
+async function restoreWhatsAppSessionsSafely() {
+  try {
+    const sessionManager = getWhatsAppWebSessionManager();
+    if (!sessionManager.isEnabled()) return;
+
+    const shops = await db.Shop.find({});
+    const count = await sessionManager.restorePersistedSessions(
+      shops.map((shop) => shop.id)
+    );
+    if (count) {
+      console.log(`Restoring ${count} linked WhatsApp shop session(s).`);
+    }
+  } catch (error) {
+    console.error('WhatsApp session restore failed:', error?.message || error);
+  }
 }
 
 export async function ensurePlatformAdmin() {
