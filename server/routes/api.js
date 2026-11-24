@@ -458,7 +458,7 @@ apiRouter.post('/whatsapp/invoice-document', async (req, res) => {
       pdf,
       caption: caption || `Invoice ${invoice.invoiceNo} from ${req.shop.name}`,
     });
-    return res.json({ ok: true, messageId: result?.messageId || result?.messages?.[0]?.id || null, duplicate: Boolean(result?.duplicate) });
+    return res.json({ ok: true, messageId: result?.messageId || result?.key?.id || result?.messages?.[0]?.id || null, duplicate: Boolean(result?.duplicate) });
   } catch (err) {
     const status = /not configured|disabled|no linked|not ready|not linked/i.test(err.message) ? 503
       : /invalid|missing|must be/i.test(err.message) ? 400 : 502;
