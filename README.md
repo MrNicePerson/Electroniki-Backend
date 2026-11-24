@@ -9,8 +9,8 @@ Install Node.js 22.12 or newer, then clone both repositories into the same paren
 ```cmd
 mkdir ElectroHub
 cd ElectroHub
-git clone https://github.com/fezu22/Electoniki-F.git frontend
-git clone https://github.com/fezu22/Electoniki-B.git backend
+git clone https://github.com/MrNicePerson/Electroniki-Front.git frontend
+git clone https://github.com/MrNicePerson/Electroniki-Backend.git backend
 ```
 
 Create the private backend environment file and install dependencies:
@@ -54,7 +54,7 @@ Open <http://localhost:5173>. The Vite dev server forwards `/api` requests to th
 Invoice PDFs can be sent as actual PDF documents through a Shop Owner's linked WhatsApp account. This is separate from the official Meta Cloud API used for installment reminders and low-stock alerts.
 
 1. In `backend/.env`, set `WHATSAPP_WEB_ENABLED=true` and choose `WHATSAPP_WEB_DATA_PATH`. The default is `./.wwebjs_auth` relative to the backend working directory. The app pins a known-good WhatsApp Web archive build (`WHATSAPP_WEB_VERSION`) and checks that its HTML is the actual web app before caching it in `./.wwebjs_cache`; this avoids accidentally loading a logged-out landing page that cannot produce a QR. The archive URL is configurable with `WHATSAPP_WEB_VERSION_ARCHIVE`.
-2. Install Chrome or Chromium on the host. Puppeteer's bundled browser may be installed by `npm install`; on Linux, install Chromium's runtime libraries as required by Puppeteer. If using system Chrome/Chromium, set `WHATSAPP_WEB_BROWSER_PATH` to its executable path.
+2. Install the Puppeteer browser used by `whatsapp-web.js` and any required Chromium runtime libraries on the host. Do not set a machine-specific Windows executable path; the backend uses Puppeteer's default browser discovery.
 3. Give the backend a persistent, private writable disk/volume mounted at the session path. The `LocalAuth` directories contain account credentials and must never be copied to the frontend, served over HTTP, committed to Git, or shared. Do not run multiple backend workers against the same WhatsApp session directory.
 4. Sign in as the Shop Owner, open Settings → WhatsApp Invoice Connection, select **Link WhatsApp**, and scan the displayed QR in WhatsApp → Linked devices → Link a device. The server stores a separate `LocalAuth` session for each shop and attempts to restore saved sessions at startup.
 5. Keep the backend process and persistent volume running. Disconnect from the same owner-only Settings section to log out and remove that shop's saved local session.

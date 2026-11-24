@@ -55,7 +55,7 @@ function shopSessionId(shopId) {
 export function createWhatsAppWebSessionManager({
   env = process.env,
   dataPath = env.WHATSAPP_WEB_DATA_PATH || path.resolve(process.cwd(), '.wwebjs_auth'),
-  clientFactory = async ({ clientId, dataPath: authPath, browserPath }) => {
+  clientFactory = async ({ clientId, dataPath: authPath }) => {
     const webVersion = String(env.WHATSAPP_WEB_VERSION || DEFAULT_WEB_VERSION).trim();
     const webVersionArchive = String(env.WHATSAPP_WEB_VERSION_ARCHIVE || DEFAULT_WEB_VERSION_ARCHIVE).trim();
     const webVersionCachePath = await prepareWhatsAppWebVersion({
@@ -72,7 +72,6 @@ export function createWhatsAppWebSessionManager({
       userAgent: false,
       puppeteer: {
         headless: true,
-        ...(browserPath ? { executablePath: browserPath } : {}),
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
       },
     });
@@ -155,7 +154,6 @@ export function createWhatsAppWebSessionManager({
           client = await clientFactory({
             clientId: shopSessionId(id),
             dataPath: rootPath,
-            browserPath: String(env.WHATSAPP_WEB_BROWSER_PATH || '').trim(),
             shopId: id,
           });
           entry.client = client;
