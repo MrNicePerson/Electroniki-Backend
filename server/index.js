@@ -111,6 +111,18 @@ export function createApp() {
 
     const origin = req.get('Origin');
 
+    if (req.get('Sec-Fetch-Site') === 'cross-site') {
+      let isTrustedFrontend = false;
+      try {
+        isTrustedFrontend = Boolean(origin && allowedOrigins.has(new URL(origin).origin));
+      } catch {
+        // The origin validation below returns the specific invalid-origin response.
+      }
+      if (!isTrustedFrontend) {
+        return res.status(403).json({ error: 'Cross-site requests are not allowed.' });
+      }
+    }
+
     // Preserve existing behavior for requests without an Origin header.
     if (origin) {
       try {
