@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs/promises';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import path from 'node:path';
 import QRCode from 'qrcode';
 import mongoose from 'mongoose';
@@ -21,7 +22,7 @@ export async function prepareWhatsAppWebVersion({ version, cachePath, archiveTem
     && !/<html\b[^>]*\bid\s*=\s*["']whatsapp-web-logged-out["']/i.test(html);
 
   try {
-    const cachedHtml = await fs.readFile(cacheFile, 'utf8');
+    const cachedHtml = await fsp.readFile(cacheFile, 'utf8');
     if (isValidAppHtml(cachedHtml)) return cachePath;
   } catch {
     // Download the requested pinned build when there is no valid local copy.
@@ -40,8 +41,8 @@ export async function prepareWhatsAppWebVersion({ version, cachePath, archiveTem
   if (html.length > 10 * 1024 * 1024 || !isValidAppHtml(html)) {
     throw new Error('The pinned WhatsApp Web build is not a valid logged-in app page; refusing to start this session.');
   }
-  await fs.mkdir(cachePath, { recursive: true });
-  await fs.writeFile(cacheFile, html, 'utf8');
+  await fsp.mkdir(cachePath, { recursive: true });
+  await fsp.writeFile(cacheFile, html, 'utf8');
   return cachePath;
 }
 
@@ -69,11 +70,11 @@ function createMongoSessionStore(mongooseInstance, dataPath) {
       const sourcePath = path.join(dataPath, archiveName);
       const storePath = path.resolve(process.cwd(), archiveName);
       if (sourcePath === storePath) return mongoStore.save(options);
-      await fs.copyFile(sourcePath, storePath);
+      await fsp.copyFile(sourcePath, storePath);
       try {
         return await mongoStore.save(options);
       } finally {
-        await fs.rm(storePath, { force: true });
+        await fsp.rm(storePath, { force: true });
       }
     },
     extract: (options) => mongoStore.extract(options),
@@ -113,6 +114,7 @@ export function createWhatsAppWebSessionManager({
   }
 
   const createClient = clientFactory || (async ({ clientId, dataPath: authPath, shopId }) => {
+    fs.mkdirSync(authPath, { recursive: true });
     const webVersion = String(env.WHATSAPP_WEB_VERSION || DEFAULT_WEB_VERSION).trim();
     const webVersionArchive = String(env.WHATSAPP_WEB_VERSION_ARCHIVE || DEFAULT_WEB_VERSION_ARCHIVE).trim();
     const webVersionCachePath = await prepareWhatsAppWebVersion({
@@ -185,8 +187,8 @@ export function createWhatsAppWebSessionManager({
     let lastError;
     for (let attempt = 0; attempt < 4; attempt += 1) {
       try {
-        await Promise.all(paths.map((profilePath) => fs.rm(profilePath, { recursive: true, force: true, maxRetries: 2, retryDelay: 250 })));
-        await Promise.all(paths.map((profilePath) => fs.access(profilePath).then(
+        await Promise.all(paths.map((profilePath) => fsp.rm(profilePath, { recursive: true, force: true, maxRetries: 2, retryDelay: 250 })));
+        await Promise.all(paths.map((profilePath) => fsp.access(profilePath).then(
           () => { throw new Error(`The old WhatsApp profile is still present at ${profilePath}.`); },
           (error) => { if (error?.code !== 'ENOENT') throw error; },
         )));
@@ -237,6 +239,7 @@ export function createWhatsAppWebSessionManager({
       for (let attempt = 0; attempt < 3; attempt += 1) {
         let client;
         try {
+          fs.mkdirSync(rootPath, { recursive: true });
           client = await createClient({
             clientId: shopSessionId(id),
             dataPath: rootPath,
@@ -296,6 +299,7 @@ export function createWhatsAppWebSessionManager({
             entry.latestQr = '';
             entry.error = String(reason || 'WhatsApp device disconnected.');
           });
+          fs.mkdirSync(rootPath, { recursive: true });
           await client.initialize();
           entry.needsFreshSession = false;
           break;
