@@ -93,7 +93,26 @@ export function createWhatsAppWebSessionManager({
   env = process.env,
   dataPath = env.WHATSAPP_WEB_DATA_PATH || path.resolve(process.cwd(), '.wwebjs_auth'),
   remoteStore,
-  clientFactory = async ({ clientId, dataPath: authPath, shopId }) => {
+  clientFactory,
+  qrEncoder = (value) => QRCode.toDataURL(value, { errorCorrectionLevel: 'M', margin: 2, width: 320 }),
+  messageMediaFactory = (mimeType, data, fileName) => new MessageMedia(mimeType, data, fileName),
+  now = () => Date.now(),
+} = {}) {
+  const sessions = new Map();
+  const invoiceSends = new Map();
+  const rootPath = path.resolve(dataPath);
+  let sessionStore = remoteStore || null;
+
+  function getSessionStore() {
+    if (sessionStore) return sessionStore;
+    if (mongoose.connection.readyState !== 1 || !mongoose.connection.db) {
+      throw new Error('MongoDB must be connected before WhatsApp session storage can start.');
+    }
+    sessionStore = createMongoSessionStore(mongoose, rootPath);
+    return sessionStore;
+  }
+
+  const createClient = clientFactory || (async ({ clientId, dataPath: authPath, shopId }) => {
     const webVersion = String(env.WHATSAPP_WEB_VERSION || DEFAULT_WEB_VERSION).trim();
     const webVersionArchive = String(env.WHATSAPP_WEB_VERSION_ARCHIVE || DEFAULT_WEB_VERSION_ARCHIVE).trim();
     const webVersionCachePath = await prepareWhatsAppWebVersion({
@@ -105,7 +124,7 @@ export function createWhatsAppWebSessionManager({
       authStrategy: new RemoteAuth({
         clientId,
         dataPath: authPath,
-        store: sessionStore,
+        store: getSessionStore(),
         backupSyncIntervalMs: 300000,
       }),
       webVersion,
@@ -149,15 +168,7 @@ export function createWhatsAppWebSessionManager({
       }
     };
     return client;
-  },
-  qrEncoder = (value) => QRCode.toDataURL(value, { errorCorrectionLevel: 'M', margin: 2, width: 320 }),
-  messageMediaFactory = (mimeType, data, fileName) => new MessageMedia(mimeType, data, fileName),
-  now = () => Date.now(),
-} = {}) {
-  const sessions = new Map();
-  const invoiceSends = new Map();
-  const rootPath = path.resolve(dataPath);
-  const sessionStore = remoteStore || createMongoSessionStore(mongoose, rootPath);
+  });
 
   const isEnabled = () => truthy(env.WHATSAPP_WEB_ENABLED);
   const sessionPath = (shopId) => path.join(rootPath, remoteSessionName(shopId));
@@ -165,7 +176,7 @@ export function createWhatsAppWebSessionManager({
   async function removeSavedProfile(shopId) {
     const clientId = shopSessionId(shopId);
     const session = remoteSessionName(shopId);
-    await sessionStore.delete({ session });
+    await getSessionStore().delete({ session });
     const paths = [
       sessionPath(shopId),
       path.join(rootPath, `${session}.zip`),
@@ -226,7 +237,7 @@ export function createWhatsAppWebSessionManager({
       for (let attempt = 0; attempt < 3; attempt += 1) {
         let client;
         try {
-          client = await clientFactory({
+          client = await createClient({
             clientId: shopSessionId(id),
             dataPath: rootPath,
             shopId: id,
@@ -331,7 +342,7 @@ export function createWhatsAppWebSessionManager({
     const id = String(shopId || '');
     let entry = sessions.get(id);
     if (!entry) {
-      if (!await sessionStore.sessionExists({ session: remoteSessionName(id) })) return publicStatus(id);
+      if (!await getSessionStore().sessionExists({ session: remoteSessionName(id) })) return publicStatus(id);
       entry = startClient(id, { remoteSessionSaved: true }); // Restore a previously linked RemoteAuth session lazily.
     }
     return publicStatus(id, entry);
@@ -424,7 +435,7 @@ export function createWhatsAppWebSessionManager({
     let restored = 0;
     for (const shopId of shopIds) {
       try {
-        if (!await sessionStore.sessionExists({ session: remoteSessionName(shopId) })) continue;
+        if (!await getSessionStore().sessionExists({ session: remoteSessionName(shopId) })) continue;
         startClient(shopId, { remoteSessionSaved: true });
         restored += 1;
       } catch {
