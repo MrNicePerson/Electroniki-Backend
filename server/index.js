@@ -233,7 +233,7 @@ export async function startServer() {
 
       startAutomationScheduler();
       // Mongoose has connected before startServer reaches this callback.
-      // Keep WhatsApp/RemoteAuth failures isolated from the HTTP server startup.
+      // Keep Mongo-backed Baileys restore failures isolated from HTTP startup.
       void restoreWhatsAppSessionsSafely();
 
       resolve(server);
