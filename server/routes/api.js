@@ -1363,65 +1363,158 @@ apiRouter.put('/sales/:invoiceNo', async (req, res) => {
     const invoiceNo = String(req.params.invoiceNo || '').trim();
     const invoice = await db.Sale.findOne({ invoiceNo, shopId: req.shopId });
     if (!invoice) return res.status(404).json({ error: 'Invoice not found.' });
-
     const body = req.body || {};
-    const textFields = ['customer', 'phone', 'whatsapp', 'cnic', 'address', 'guarantor', 'guarantorPhone', 'guarantorAddress', 'guarantorCnic', 'padNo'];
-    const patch = {};
-    for (const field of textFields) {
-      if (body[field] !== undefined) {
-        const value = String(body[field] || '').trim();
-        if (field === 'customer' && !value) return res.status(400).json({ error: 'Customer name is required.' });
-        const maxLength = field === 'padNo' ? 40 : field === 'address' || field === 'guarantorAddress' ? 300 : 120;
-        if (value.length > maxLength) return res.status(400).json({ error: `${field} is too long.` });
-        patch[field] = value;
-      }
+    if (!Array.isArray(body.items) || !body.items.length) return res.status(400).json({ error: 'Add at least one item to the invoice.' });
+    if ((body.saleType || invoice.type) !== invoice.type) return res.status(400).json({ error: 'An invoice sale type cannot be changed during editing.' });
+    const plan = await db.InstallmentPlan.findOne({ shopId: req.shopId, invoiceNo });
+    if (invoice.type === 'installment' && !plan) return res.status(409).json({ error: 'This installment invoice has no linked plan and cannot be edited safely.' });
+    const [payments, returns] = await Promise.all([
+      plan ? db.InstallmentPayment.find({ shopId: req.shopId, planId: plan.id }) : [],
+      db.CustomerReturn.find({ shopId: req.shopId, invoiceNo }),
+    ]);
+    if (payments.length || returns.length || num(invoice.paid) > num(invoice.initialPaid) || plan && num(plan.paid) > num(plan.advancePaid)) {
+      return res.status(409).json({ error: 'This invoice has later payments or returns. It cannot be repriced after those ledger entries were recorded.' });
     }
-    if (Array.isArray(body.items)) {
-      if (body.items.length !== (invoice.items || []).length) {
-        return res.status(400).json({ error: 'Invoice item count cannot be changed in this editor.' });
-      }
-      patch.items = invoice.items.map((item, index) => {
-        const name = String(body.items[index]?.name ?? item.name).trim();
-        if (!name || name.length > 180) throw Object.assign(new Error('Each item description must contain 1-180 characters.'), { status: 400 });
-        return { ...item, name };
-      });
-    }
-    if (!Object.keys(patch).length) return res.status(400).json({ error: 'Make a change before saving.' });
 
+    const salePayment = body.salePayment || {};
+    const saleType = invoice.type;
+    const customerInfo = body.customerInfo || {};
+    const discount = Number(body.billDiscount ?? invoice.billDiscount ?? 0);
+    const months = Math.floor(num(body.plan?.months ?? invoice.months ?? 12));
+    const percent = num(body.plan?.percent ?? invoice.installmentPercent ?? 0);
+    const method = String(salePayment.method || invoice.paymentDetails?.method || 'cash').toLowerCase();
+    if (!Number.isFinite(discount) || discount < 0 || !['cash', 'bank'].includes(method) || saleType === 'installment' && (months < 1 || months > 60 || percent < 0 || percent > 100)) {
+      return res.status(400).json({ error: 'Enter a valid discount, payment method, and installment plan.' });
+    }
+    const productsById = await getAvailableProductsAfterHeldOrders(req.shopId);
+    const oldQtyByProduct = new Map();
+    for (const item of invoice.items || []) {
+      const productId = String(item.productId || '');
+      if (!productId || !productsById.has(productId)) return res.status(409).json({ error: 'This invoice contains a custom or removed item and cannot be edited in New Sale.' });
+      oldQtyByProduct.set(productId, (oldQtyByProduct.get(productId) || 0) + Math.max(0, Math.floor(num(item.qty))));
+    }
+    for (const [productId, quantity] of oldQtyByProduct) {
+      const product = productsById.get(productId);
+      productsById.set(productId, { ...product, stock: num(product.stock) + quantity });
+    }
+    const stockCheck = validateStockAvailability(body.items, productsById);
+    if (!stockCheck.valid) return res.status(400).json({ error: stockCheck.errors[0], errors: stockCheck.errors });
+    const enrichedItems = body.items.map((item) => {
+      const product = productsById.get(String(item.productId || item.id));
+      const price = Number(item.price);
+      if (!product || !Number.isFinite(price) || price <= 0) throw Object.assign(new Error('Select a valid product and enter a positive price.'), { status: 400 });
+      return {
+        productId: product.id, name: product.name, code: product.code, category: product.category || 'Electronics',
+        serialNumber: String(item.serialNumber || ''), warranty: String(item.warranty || ''),
+        qty: Math.floor(num(item.qty)), price, cost: num(product.cost),
+      };
+    });
+    const totals = calculateSaleTotals({
+      items: enrichedItems, billDiscount: discount, saleType,
+      installmentPercent: percent, advance: body.plan?.advance ?? invoice.initialPaid,
+      months, paymentMethod: method, cashAmount: salePayment.cash, bankAmount: salePayment.bank,
+    });
+    if (discount > totals.gross || totals.excess > 0) return res.status(400).json({ error: discount > totals.gross ? 'Bill discount cannot exceed the sale subtotal.' : 'Received payment cannot exceed the invoice total.' });
+    let customerName = String(customerInfo.name || invoice.customer || '').trim();
+    if (!customerName) return res.status(400).json({ error: 'Customer name is required.' });
+    let customerId = body.customerId || invoice.customerId || 'walkin';
+    let customer = customerId !== 'walkin' ? await db.Customer.findOne({ _id: customerId, shopId: req.shopId }) : null;
+    if (customerId !== 'walkin' && !customer) return res.status(400).json({ error: 'Selected customer was not found.' });
+    const customerFields = {
+      name: customerName,
+      phone: String(customerInfo.phone || ''), whatsapp: String(customerInfo.whatsapp || customerInfo.phone || ''),
+      cnic: String(customerInfo.cnic || ''), address: String(customerInfo.address || ''),
+      guarantor: String(customerInfo.guarantor || ''), guarantorPhone: String(customerInfo.guarantorPhone || ''),
+      guarantorAddress: String(customerInfo.guarantorAddress || ''), guarantorCnic: String(customerInfo.guarantorCnic || ''),
+    };
+    if (saleType === 'cash' && customerId === 'walkin' && totals.balance > 0) return res.status(400).json({ error: 'Walk-in sales must be paid in full.' });
     const result = await runInTransaction(async () => {
-      const updatedSale = await db.Sale.updateOne({ _id: invoice.id, shopId: req.shopId }, patch);
-      if (invoice.type === 'installment') {
-        const plan = await db.InstallmentPlan.findOne({ shopId: req.shopId, invoiceNo });
-        if (plan) {
-          const planPatch = {};
-          if (patch.customer !== undefined) planPatch.customerName = patch.customer;
-          for (const field of ['phone', 'whatsapp', 'cnic', 'address', 'guarantor', 'guarantorPhone', 'guarantorAddress', 'guarantorCnic']) {
-            if (patch[field] !== undefined) planPatch[field] = patch[field];
-          }
-          if (Object.keys(planPatch).length) {
-            const details = plan.installmentDetails || {};
-            planPatch.installmentDetails = {
-              ...details,
-              customer: { ...(details.customer || {}) },
-              guarantor: { ...(details.guarantor || {}) },
-            };
-            if (patch.customer !== undefined) planPatch.installmentDetails.customer.name = patch.customer;
-            for (const field of ['phone', 'whatsapp', 'cnic', 'address']) {
-              if (patch[field] !== undefined) planPatch.installmentDetails.customer[field] = patch[field];
-            }
-            for (const [saleField, planField] of [['guarantor', 'name'], ['guarantorPhone', 'phone'], ['guarantorAddress', 'address'], ['guarantorCnic', 'cnic']]) {
-              if (patch[saleField] !== undefined) planPatch.installmentDetails.guarantor[planField] = patch[saleField];
-            }
-            await db.InstallmentPlan.updateOne({ _id: plan.id, shopId: req.shopId }, planPatch);
-          }
+      const oldCredit = invoice.customerId !== 'walkin' && invoice.type === 'cash' ? num(invoice.balance) : 0;
+      const newCredit = customerId !== 'walkin' && saleType === 'cash' ? num(totals.balance) : 0;
+      if (invoice.customerId !== 'walkin' && invoice.customerId !== customerId && oldCredit) {
+        const previousCustomer = await db.Customer.findOne({ _id: invoice.customerId, shopId: req.shopId });
+        if (previousCustomer) await db.Customer.updateOne({ _id: previousCustomer.id, shopId: req.shopId }, { creditBalance: Math.max(0, num(previousCustomer.creditBalance) - oldCredit) });
+      }
+      if (customer) {
+        const priorBalance = num(customer.creditBalance);
+        await db.Customer.updateOne({ _id: customer.id, shopId: req.shopId }, {
+          ...customerFields,
+          creditBalance: Math.max(0, priorBalance - (invoice.customerId === customerId ? oldCredit : 0) + newCredit),
+        });
+      }
+
+      const oldItemsByProduct = new Map();
+      for (const item of invoice.items || []) oldItemsByProduct.set(String(item.productId), (oldItemsByProduct.get(String(item.productId)) || 0) + num(item.qty));
+      const newItemsByProduct = new Map();
+      for (const item of totals.items) newItemsByProduct.set(String(item.productId), (newItemsByProduct.get(String(item.productId)) || 0) + num(item.qty));
+      for (const productId of new Set([...oldItemsByProduct.keys(), ...newItemsByProduct.keys()])) {
+        const product = await db.Product.findOne({ _id: productId, shopId: req.shopId });
+        if (!product) throw Object.assign(new Error('An invoice product no longer exists.'), { status: 409 });
+        const delta = (oldItemsByProduct.get(productId) || 0) - (newItemsByProduct.get(productId) || 0);
+        const nextStock = num(product.stock) + delta;
+        if (nextStock < 0) throw Object.assign(new Error(`Not enough stock for ${product.name}.`), { status: 400 });
+        if (delta) {
+          await db.Product.updateOne({ _id: product.id, shopId: req.shopId }, { stock: nextStock });
+          await db.StockMovement.create({ shopId: req.shopId, productId, productName: product.name, code: product.code, type: 'adjustment', qtyChange: delta, stockAfter: nextStock, unitCost: product.cost, unitPrice: 0, referenceId: invoiceNo, note: `Invoice ${invoiceNo} edit stock adjustment`, createdBy: req.user.name });
         }
       }
+      const bankName = String(salePayment.bankName || '').trim();
+      const oldBankName = String(invoice.paymentDetails?.bankName || '').trim();
+      const oldBank = oldBankName ? await db.BankAccount.findOne({ shopId: req.shopId, bankName: oldBankName }) : null;
+      const newBank = bankName ? await db.BankAccount.findOne({ shopId: req.shopId, bankName }) : null;
+      if (totals.bankCollected && bankName && (!newBank || newBank.active === false)) throw Object.assign(new Error('Select an active bank account or leave the payment unassigned.'), { status: 400 });
+      if (oldBank && newBank && String(oldBank.id) === String(newBank.id)) {
+        await db.BankAccount.updateOne({ _id: oldBank.id, shopId: req.shopId }, { balance: signedNum(oldBank.balance) + num(totals.bankCollected) - num(invoice.bankCollected) });
+      } else {
+        if (oldBank && num(invoice.bankCollected)) await db.BankAccount.updateOne({ _id: oldBank.id, shopId: req.shopId }, { balance: signedNum(oldBank.balance) - num(invoice.bankCollected) });
+        if (newBank && totals.bankCollected) await db.BankAccount.updateOne({ _id: newBank.id, shopId: req.shopId }, { balance: signedNum(newBank.balance) + totals.bankCollected });
+      }
+      const addPaymentAdjustment = async (payMethod, delta, adjustmentBank = '') => {
+        if (!delta) return;
+        await db.FinancialTransaction.create({
+          shopId: req.shopId, txNo: 'FIN-' + String(Date.now()).slice(-6) + Math.random().toString(36).slice(2, 4).toUpperCase(),
+          type: 'sale_receipt', direction: delta > 0 ? 'in' : 'out', amount: Math.abs(delta), method: payMethod,
+          bankName: adjustmentBank, partyName: customerName, relatedId: invoiceNo,
+          note: `Invoice ${invoiceNo} edit payment adjustment`, createdBy: req.user.name,
+        });
+      };
+      await addPaymentAdjustment('cash', num(totals.cashCollected) - num(invoice.cashCollected));
+      if (oldBankName === bankName) await addPaymentAdjustment('bank', num(totals.bankCollected) - num(invoice.bankCollected), bankName);
+      else {
+        await addPaymentAdjustment('bank', -num(invoice.bankCollected), oldBankName);
+        await addPaymentAdjustment('bank', num(totals.bankCollected), bankName);
+      }
+
+      const patch = {
+        ...customerFields, customerId, padNo: String(body.padNo || '').trim().slice(0, 40),
+        items: totals.items, gross: totals.gross, billDiscount: totals.billDiscount, discounted: totals.discounted,
+        installmentPercent: totals.installmentPercent, add: totals.add, total: totals.final,
+        totalCost: totals.totalCost, initialPaid: totals.paid, paid: totals.paid,
+        cashCollected: totals.cashCollected, bankCollected: totals.bankCollected, chequeCollected: 0,
+        balance: totals.balance, paymentMethod: saleType === 'installment' ? 'Installment advance' : method,
+        paymentDetails: salePayment, months: totals.months, monthly: totals.monthly,
+        status: saleType === 'installment' ? (totals.balance > 0 ? 'Active plan' : 'Paid') : (totals.balance > 0 ? 'Partial / Udhaar' : 'Paid'),
+      };
+      const updatedSale = await db.Sale.updateOne({ _id: invoice.id, shopId: req.shopId }, patch);
+      let updatedPlan = null;
+      if (plan) {
+        const details = plan.installmentDetails || {};
+        const customerDetails = { ...(details.customer || {}), ...customerFields, photoDataUrl: customerInfo.customerPhoto || details.customer?.photoDataUrl || '' };
+        const guarantorDetails = { ...(details.guarantor || {}), name: customerFields.guarantor, phone: customerFields.guarantorPhone, address: customerFields.guarantorAddress, cnic: customerFields.guarantorCnic, photoDataUrl: customerInfo.guarantorPhoto || details.guarantor?.photoDataUrl || '' };
+        const planDetails = { ...(details.plan || {}), totalAmount: totals.final, advancePaid: totals.paid, balance: totals.balance, months: totals.months, monthlyAmount: totals.monthly, installmentPercent: totals.installmentPercent };
+        updatedPlan = await db.InstallmentPlan.updateOne({ _id: plan.id, shopId: req.shopId }, {
+          customerId, customerName, phone: customerFields.phone, whatsapp: customerFields.whatsapp, cnic: customerFields.cnic, address: customerFields.address,
+          guarantor: customerFields.guarantor, guarantorPhone: customerFields.guarantorPhone, guarantorAddress: customerFields.guarantorAddress, guarantorCnic: customerFields.guarantorCnic,
+          productSummary: totals.items.map((item) => `${item.name} x ${item.qty}`).join(', '), totalAmount: totals.final, advancePaid: totals.paid, paid: totals.paid, balance: totals.balance, months: totals.months, monthlyAmount: totals.monthly, installmentPercent: totals.installmentPercent, status: totals.balance > 0 ? 'Active' : 'Paid',
+          installmentDetails: { ...details, customer: customerDetails, guarantor: guarantorDetails, plan: planDetails },
+        });
+      }
       await logAudit(req.shopId, req.user, 'sale_invoice_edited', 'Sale', invoice.id, `Edited invoice ${invoiceNo} details and item descriptions`);
-      return updatedSale;
+      return { sale: updatedSale, plan: updatedPlan };
     });
-    return res.json({ sale: result });
+    return res.json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.status === 400 ? err.message : 'Failed to edit invoice.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to edit invoice.' });
   }
 });
 
