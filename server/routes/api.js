@@ -30,7 +30,7 @@ import {
   calculateShopFinancialSummary,
   calculateCashSessionTotals,
 } from '../utils/calculations.js';
-import { normalizeWhatsAppNumber } from '../utils/whatsappPhone.js';
+import { formatWhatsAppJid, normalizeWhatsAppNumber } from '../utils/whatsappPhone.js';
 import { whatsappService } from '../services/whatsappService.js';
 import { decryptSecret, encryptSecret } from '../utils/secrets.js';
 
@@ -444,32 +444,14 @@ apiRouter.post('/whatsapp/invoice-document', async (req, res) => {
   try {
     const invoice = await db.Sale.findOne({ invoiceNo: String(invoiceNo || '').trim(), shopId: req.shopId });
     if (!invoice) return res.status(404).json({ error: 'This invoice was not found in your shop.' });
-    const customer = invoice.customerId && invoice.customerId !== 'walkin'
-      ? await db.Customer.findOne({ _id: invoice.customerId, shopId: req.shopId })
-      : null;
-    const savedCustomerNumbers = [...new Set([
-      invoice.customerWhatsapp,
-      invoice.customerPhone,
-      invoice.phone,
-      invoice.whatsapp,
-      customer?.customerWhatsapp,
-      customer?.customerPhone,
-      customer?.phone,
-      customer?.whatsapp,
-    ].map(normalizeWhatsAppNumber).filter(Boolean))];
-    const recipientNumber = normalizeWhatsAppNumber(to);
-    if (!recipientNumber) {
-      return res.status(400).json({ error: 'Enter a valid customer WhatsApp number to send this invoice.' });
-    }
-    if (savedCustomerNumbers.length && !savedCustomerNumbers.includes(recipientNumber)) {
-      return res.status(400).json({ error: 'The recipient must match the WhatsApp number saved on this invoice.' });
-    }
+    const recipientJid = formatWhatsAppJid(to);
+    if (!recipientJid) return res.status(400).json({ error: 'Enter a valid WhatsApp number to send this invoice.' });
     const encodedPdf = String(pdfDataUrl).split(',')[1].replace(/\s/g, '');
     const pdf = Buffer.from(encodedPdf, 'base64');
     const result = await whatsappService.sendInvoiceDocument({
       shopId: req.shopId,
       invoiceNo: invoice.invoiceNo,
-      to: recipientNumber,
+      to: recipientJid,
       fileName,
       pdf,
       caption: caption || `Invoice ${invoice.invoiceNo} from ${req.shop.name}`,
