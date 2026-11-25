@@ -1358,6 +1358,73 @@ apiRouter.delete('/customers/:id', async (req, res) => {
 // 5. NEW SALE & BILLS WORKFLOW (Transaction-Safe + Stock Validated)
 // ============================================================================
 
+apiRouter.put('/sales/:invoiceNo', async (req, res) => {
+  try {
+    const invoiceNo = String(req.params.invoiceNo || '').trim();
+    const invoice = await db.Sale.findOne({ invoiceNo, shopId: req.shopId });
+    if (!invoice) return res.status(404).json({ error: 'Invoice not found.' });
+
+    const body = req.body || {};
+    const textFields = ['customer', 'phone', 'whatsapp', 'cnic', 'address', 'guarantor', 'guarantorPhone', 'guarantorAddress', 'guarantorCnic', 'padNo'];
+    const patch = {};
+    for (const field of textFields) {
+      if (body[field] !== undefined) {
+        const value = String(body[field] || '').trim();
+        if (field === 'customer' && !value) return res.status(400).json({ error: 'Customer name is required.' });
+        const maxLength = field === 'padNo' ? 40 : field === 'address' || field === 'guarantorAddress' ? 300 : 120;
+        if (value.length > maxLength) return res.status(400).json({ error: `${field} is too long.` });
+        patch[field] = value;
+      }
+    }
+    if (Array.isArray(body.items)) {
+      if (body.items.length !== (invoice.items || []).length) {
+        return res.status(400).json({ error: 'Invoice item count cannot be changed in this editor.' });
+      }
+      patch.items = invoice.items.map((item, index) => {
+        const name = String(body.items[index]?.name ?? item.name).trim();
+        if (!name || name.length > 180) throw Object.assign(new Error('Each item description must contain 1-180 characters.'), { status: 400 });
+        return { ...item, name };
+      });
+    }
+    if (!Object.keys(patch).length) return res.status(400).json({ error: 'Make a change before saving.' });
+
+    const result = await runInTransaction(async () => {
+      const updatedSale = await db.Sale.updateOne({ _id: invoice.id, shopId: req.shopId }, patch);
+      if (invoice.type === 'installment') {
+        const plan = await db.InstallmentPlan.findOne({ shopId: req.shopId, invoiceNo });
+        if (plan) {
+          const planPatch = {};
+          if (patch.customer !== undefined) planPatch.customerName = patch.customer;
+          for (const field of ['phone', 'whatsapp', 'cnic', 'address', 'guarantor', 'guarantorPhone', 'guarantorAddress', 'guarantorCnic']) {
+            if (patch[field] !== undefined) planPatch[field] = patch[field];
+          }
+          if (Object.keys(planPatch).length) {
+            const details = plan.installmentDetails || {};
+            planPatch.installmentDetails = {
+              ...details,
+              customer: { ...(details.customer || {}) },
+              guarantor: { ...(details.guarantor || {}) },
+            };
+            if (patch.customer !== undefined) planPatch.installmentDetails.customer.name = patch.customer;
+            for (const field of ['phone', 'whatsapp', 'cnic', 'address']) {
+              if (patch[field] !== undefined) planPatch.installmentDetails.customer[field] = patch[field];
+            }
+            for (const [saleField, planField] of [['guarantor', 'name'], ['guarantorPhone', 'phone'], ['guarantorAddress', 'address'], ['guarantorCnic', 'cnic']]) {
+              if (patch[saleField] !== undefined) planPatch.installmentDetails.guarantor[planField] = patch[saleField];
+            }
+            await db.InstallmentPlan.updateOne({ _id: plan.id, shopId: req.shopId }, planPatch);
+          }
+        }
+      }
+      await logAudit(req.shopId, req.user, 'sale_invoice_edited', 'Sale', invoice.id, `Edited invoice ${invoiceNo} details and item descriptions`);
+      return updatedSale;
+    });
+    return res.json({ sale: result });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.status === 400 ? err.message : 'Failed to edit invoice.' });
+  }
+});
+
 apiRouter.post('/sales', async (req, res) => {
   try {
     const {
