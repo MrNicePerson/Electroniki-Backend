@@ -458,7 +458,7 @@ apiRouter.post('/whatsapp/invoice-document', async (req, res) => {
     });
     return res.json({ ok: true, messageId: result?.messageId || result?.key?.id || result?.messages?.[0]?.id || null, duplicate: Boolean(result?.duplicate) });
   } catch (err) {
-    const status = /not configured|disabled|no linked|not ready|not linked/i.test(err.message) ? 503
+    const status = /not configured|disabled|no linked|not ready|not linked|reconnect|session changed/i.test(err.message) ? 503
       : /invalid|missing|must be/i.test(err.message) ? 400 : 502;
     return res.status(status).json({ error: err.message || 'Could not send the invoice PDF through WhatsApp.' });
   }

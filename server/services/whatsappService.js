@@ -7,6 +7,7 @@ import { listSavedWhatsAppShopIds, useMongoAuthState } from './whatsappAuthState
 
 const reconnectDelayMs = 3000;
 const messageDedupeMs = 5 * 60 * 1000;
+const connectionWaitTimeoutMs = 20000;
 
 export function createWhatsAppService({
   socketFactory = makeWASocket,
@@ -160,6 +161,25 @@ export function createWhatsAppService({
     return entry;
   }
 
+  async function ensureConnectedSession(shopId) {
+    const entry = await ensureSession(shopId);
+    const deadline = Date.now() + connectionWaitTimeoutMs;
+    while (Date.now() < deadline) {
+      if (sessions.get(entry.shopId) !== entry) {
+        throw new Error('WhatsApp session changed while reconnecting. Try again.');
+      }
+      if (entry.status === 'connected' && entry.socket) return entry;
+      if (entry.status === 'qr_ready') {
+        throw new Error('This shop WhatsApp session needs linking. Scan the QR code in Settings.');
+      }
+      if (entry.status === 'not_linked' && !entry.socket) {
+        throw new Error(entry.error || 'This shop has no linked WhatsApp device. Link WhatsApp in Settings.');
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error('WhatsApp is still reconnecting on this server. Try sending again shortly.');
+  }
+
   async function getStatus(shopId) {
     const id = String(shopId || '').trim();
     if (!id) return publicStatus(id);
@@ -205,10 +225,7 @@ export function createWhatsAppService({
   }
 
   async function sendTextMessage({ shopId, to, text }) {
-    const entry = sessions.get(String(shopId || ''));
-    if (!entry || entry.status !== 'connected' || !entry.socket) {
-      throw new Error('This shop has no linked WhatsApp device. The Shop Owner must link WhatsApp in Settings.');
-    }
+    const entry = await ensureConnectedSession(shopId);
     const jid = formatWhatsAppJid(to);
     if (!jid) throw new Error('Recipient WhatsApp number is invalid.');
     return entry.socket.sendMessage(jid, { text: String(text || '') });
@@ -222,10 +239,7 @@ export function createWhatsAppService({
     const dedupeKey = `${id}:${String(invoiceNo || '')}`;
     const previous = sentInvoices.get(dedupeKey);
     if (previous && previous.expiresAt > Date.now()) return previous.promise;
-    const entry = sessions.get(id);
-    if (!entry || entry.status !== 'connected' || !entry.socket) {
-      throw new Error('This shop has no linked WhatsApp device. The Shop Owner must link WhatsApp in Settings.');
-    }
+    const entry = await ensureConnectedSession(id);
     const jid = formatWhatsAppJid(to);
     if (!jid) throw new Error('Customer WhatsApp number is invalid.');
     const safeName = String(fileName || `${invoiceNo || 'invoice'}.pdf`).replace(/[^\w.-]/g, '_').slice(0, 120) || 'invoice.pdf';
