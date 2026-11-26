@@ -38,7 +38,7 @@ async function resetRecoveredStockAlerts(shopId, products) {
 async function processLowStockAlerts(shop, products) {
   const automation = shop.automation || {};
   const recipients = normalizedRecipients(automation.lowStockRecipients || []);
-  if (!automation.lowStockAlertsEnabled || recipients.length !== 2) return;
+  if (!automation.lowStockAlertsEnabled || recipients.length === 0) return;
 
   for (const product of products) {
     const threshold = Number(product.reorderThreshold ?? 5);

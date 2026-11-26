@@ -948,6 +948,9 @@ apiRouter.put('/settings', requireOwner, async (req, res) => {
           : (req.shop.automation?.lowStockRecipients || []),
       },
     };
+    if (patch.automation.lowStockAlertsEnabled && !patch.automation.lowStockRecipients.length) {
+      return res.status(400).json({ error: 'Add at least one valid WhatsApp alert number before enabling low-stock alerts.' });
+    }
 
     const updated = await db.Shop.updateOne({ _id: req.shopId }, patch);
     await logAudit(
@@ -1429,6 +1432,11 @@ apiRouter.put('/sales/:invoiceNo', async (req, res) => {
     };
     if (saleType === 'cash' && customerId === 'walkin' && totals.balance > 0) return res.status(400).json({ error: 'Walk-in sales must be paid in full.' });
     const result = await runInTransaction(async () => {
+      if (customerId === 'walkin' && customerName.toLowerCase() !== 'walk-in customer') {
+        customer = await db.Customer.findOne({ shopId: req.shopId, name: customerName });
+        if (!customer) customer = await db.Customer.create({ shopId: req.shopId, ...customerFields, creditBalance: 0 });
+        customerId = customer.id;
+      }
       const oldCredit = invoice.customerId !== 'walkin' && invoice.type === 'cash' ? num(invoice.balance) : 0;
       const newCredit = customerId !== 'walkin' && saleType === 'cash' ? num(totals.balance) : 0;
       if (invoice.customerId !== 'walkin' && invoice.customerId !== customerId && oldCredit) {
