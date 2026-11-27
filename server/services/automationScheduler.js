@@ -25,45 +25,40 @@ function normalizedRecipients(values = []) {
   return [...new Set(values.map(normalizeWhatsAppNumber).filter(Boolean))].slice(0, 2);
 }
 
-async function resetRecoveredStockAlerts(shopId, products) {
-  for (const product of products) {
-    const threshold = Number(product.reorderThreshold ?? 5);
-    const recovered = Number(product.stock || 0) > threshold;
-    if (recovered && product.lowStockNotifiedRecipients?.length) {
-      await db.Product.updateOne({ _id: product.id, shopId }, { lowStockNotifiedRecipients: [] });
-    }
-  }
-}
-
-async function processLowStockAlerts(shop, products) {
+async function processLowStockAlerts(shop, products, dateKey, hour) {
   const automation = shop.automation || {};
   const recipients = normalizedRecipients(automation.lowStockRecipients || []);
-  if (!automation.lowStockAlertsEnabled || recipients.length === 0) return;
+  if (!automation.lowStockAlertsEnabled || recipients.length === 0 || hour !== '08') return;
 
-  for (const product of products) {
-    const threshold = Number(product.reorderThreshold ?? 5);
-    const stock = Number(product.stock || 0);
-    if (stock > threshold) continue;
-    const alreadyNotified = (product.lowStockNotifiedRecipients || []).map(normalizeWhatsAppNumber);
-    for (const recipient of recipients) {
-      if (alreadyNotified.includes(recipient)) continue;
-      const message = [
-        `Low stock alert — ${shop.name}`,
-        `Product: ${product.name}${product.code ? ` (${product.code})` : ''}`,
-        `Current stock: ${stock}`,
-        `Reorder threshold: ${threshold}`,
-        'Please arrange restocking.',
-      ].join('\n');
-      try {
-        await whatsappService.sendTextMessage({ shopId: shop.id, to: recipient, text: message });
-        alreadyNotified.push(recipient);
-        await db.Product.updateOne(
-          { _id: product.id, shopId: shop.id },
-          { lowStockNotifiedRecipients: [...new Set(alreadyNotified)] }
-        );
-      } catch (error) {
-        console.error(`Low-stock WhatsApp alert failed for product ${product.code}:`, error.message);
-      }
+  const lowStockProducts = products.filter((product) =>
+    Number(product.stock || 0) <= Number(product.reorderThreshold ?? 5)
+  );
+  if (!lowStockProducts.length) return;
+
+  // Claim one daily digest for the shop before sending, so Render restarts or
+  // multiple instances cannot send another batch on the same Pakistan date.
+  const previousAlertDate = shop.lastLowStockAlertDate || '';
+  const claimFilter = { _id: shop.id };
+  claimFilter.$or = previousAlertDate
+    ? [{ lastLowStockAlertDate: previousAlertDate }]
+    : [{ lastLowStockAlertDate: '' }, { lastLowStockAlertDate: { $exists: false } }];
+  const claim = await db.Shop.updateOne(claimFilter, { lastLowStockAlertDate: dateKey });
+  if (!claim || claim.lastLowStockAlertDate !== dateKey) return;
+
+  for (const [index, recipient] of recipients.entries()) {
+    if (index > 0) await sleep(REMINDER_MESSAGE_DELAY_MS);
+    const listedProducts = lowStockProducts;
+    const lines = listedProducts.map((product) => {
+      const stock = Number(product.stock || 0);
+      const threshold = Number(product.reorderThreshold ?? 5);
+      return `• ${product.name}${product.code ? ` (${product.code})` : ''} — stock ${stock}, reorder at ${threshold}`;
+    });
+    const message = [`Daily low-stock summary - ${shop.name}`, ...lines, 'Please arrange restocking.'].join('\n');
+
+    try {
+      await whatsappService.sendTextMessage({ shopId: shop.id, to: recipient, text: message });
+    } catch (error) {
+      console.error(`Daily low-stock WhatsApp digest failed for shop ${shop.id}:`, error.message);
     }
   }
 }
@@ -142,8 +137,7 @@ export async function runAutomationCycle(now = new Date()) {
           return `${paymentDate.year}-${paymentDate.month}` === monthKey;
         })())
         .map((payment) => String(payment.planId)));
-      await resetRecoveredStockAlerts(shop.id, products);
-      await processLowStockAlerts(shop, products);
+      await processLowStockAlerts(shop, products, dateKey, hour);
       await processInstallmentReminders(shop, plans, paidPlanIdsThisMonth, dateKey, monthKey, hour);
     }
   } finally {

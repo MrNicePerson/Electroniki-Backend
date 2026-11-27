@@ -25,6 +25,7 @@ const shopSchema = new Schema(
     taxNumber: { type: String, default: '' },
     geminiApiKeyEncrypted: { type: String, default: '' },
     automation: { type: Schema.Types.Mixed, default: () => ({}) },
+    lastLowStockAlertDate: { type: String, default: '' },
   },
   { timestamps: true }
 );

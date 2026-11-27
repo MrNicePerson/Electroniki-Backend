@@ -87,6 +87,11 @@ function matchesQuery(doc, query = {}) {
     }
     const actual = k === '_id' || k === 'id' ? doc.id || doc._id : doc[k];
     if (v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof RegExp)) {
+      if ('$exists' in v) {
+        const exists = actual !== undefined;
+        if (exists !== Boolean(v.$exists)) return false;
+        continue;
+      }
       if ('$regex' in v) {
         const re = new RegExp(v.$regex, v.$options || 'i');
         if (!re.test(String(actual ?? ''))) return false;
