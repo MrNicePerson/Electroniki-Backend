@@ -76,6 +76,16 @@ async function processInstallmentReminders(shop, plans, paidPlanIdsThisMonth, da
     if (!shouldSendInstallmentReminder(plan, dateKey, monthKey, hour, paidPlanIdsThisMonth.has(String(plan.id)))) continue;
     const recipient = normalizeWhatsAppNumber(plan.whatsapp || plan.phone);
     if (!recipient) continue;
+
+    // Claim the date before sending. Render may run more than one server
+    // instance, so a post-send update alone can let both instances send.
+    const previousReminderDate = plan.lastWhatsAppReminderDate || '';
+    const claimedPlan = await db.InstallmentPlan.updateOne(
+      { _id: plan.id, shopId: shop.id, lastWhatsAppReminderDate: previousReminderDate },
+      { lastWhatsAppReminderDate: dateKey, lastWhatsAppReminderMonth: monthKey }
+    );
+    if (!claimedPlan || claimedPlan.lastWhatsAppReminderDate !== dateKey) continue;
+
     if (attempted > 0) await sleep(REMINDER_MESSAGE_DELAY_MS);
     attempted += 1;
 
@@ -92,10 +102,6 @@ async function processInstallmentReminders(shop, plans, paidPlanIdsThisMonth, da
 
     try {
       await whatsappService.sendTextMessage({ shopId: shop.id, to: recipient, text: message });
-      await db.InstallmentPlan.updateOne(
-        { _id: plan.id, shopId: shop.id },
-        { lastWhatsAppReminderDate: dateKey, lastWhatsAppReminderMonth: monthKey }
-      );
     } catch (error) {
       console.error(`Installment WhatsApp reminder failed for plan ${plan.planNo}:`, error.message);
     }
