@@ -29,6 +29,7 @@ async function processLowStockAlerts(shop, products, dateKey, hour) {
   const automation = shop.automation || {};
   const recipients = normalizedRecipients(automation.lowStockRecipients || []);
   if (!automation.lowStockAlertsEnabled || recipients.length === 0 || hour !== '08') return;
+  if (shop.lastLowStockAlertDate === dateKey) return;
 
   const lowStockProducts = products.filter((product) =>
     Number(product.stock || 0) <= Number(product.reorderThreshold ?? 5)
