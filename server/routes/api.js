@@ -2122,7 +2122,10 @@ apiRouter.put('/installments/:planId', async (req, res) => {
   try {
     const existing = await db.InstallmentPlan.findOne({ _id: req.params.planId, shopId: req.shopId });
     if (!existing) return res.status(404).json({ error: 'Installment plan not found.' });
-    const body = req.body || {};
+    let body = req.body || {};
+    if (typeof body === 'string') {
+      try { body = JSON.parse(body); } catch { return res.status(400).json({ error: 'Invalid installment plan update data.' }); }
+    }
     const months = body.months === undefined ? Number(existing.months) : Number(body.months);
     const monthlyAmount = body.monthlyAmount === undefined ? num(existing.monthlyAmount) : Number(body.monthlyAmount);
     if (!Number.isSafeInteger(months) || months < 1 || months > 60 || !Number.isFinite(monthlyAmount) || monthlyAmount < 0 ||
@@ -2169,16 +2172,12 @@ apiRouter.delete('/installments/:planId', async (req, res) => {
       db.InstallmentPayment.find({ shopId: req.shopId, planId: plan.id }),
       plan.saleId ? db.Sale.findOne({ _id: plan.saleId, shopId: req.shopId }) : null,
     ]);
-    if (payments.length || num(plan.advancePaid) > 0 || sale && ((sale.items || []).length > 0 || num(sale.paid) > 0 || num(sale.cashCollected) > 0 || num(sale.bankCollected) > 0)) {
-      return res.status(409).json({ error: 'This plan has received money, payments, or product sales. Keep it so the ledger and invoice history remain complete.' });
-    }
-    await runInTransaction(async () => {
-      await db.InstallmentPlan.deleteOne({ _id: plan.id, shopId: req.shopId });
-      if (sale) await db.Sale.deleteOne({ _id: sale.id, shopId: req.shopId });
-      await logAudit(req.shopId, req.user, 'installment_plan_deleted', 'InstallmentPlan', plan.id,
-        `Deleted unpaid installment plan ${plan.planNo || plan.invoiceNo}`);
+    await db.InstallmentPlan.updateOne({ _id: plan.id, shopId: req.shopId }, {
+      status: 'Archived', whatsappReminderEnabled: false,
     });
-    return res.json({ ok: true });
+    await logAudit(req.shopId, req.user, 'installment_plan_archived', 'InstallmentPlan', plan.id,
+      `Archived installment plan ${plan.planNo || plan.invoiceNo}; its sale and ${payments.length} payment records were retained`);
+    return res.json({ ok: true, archived: true });
   } catch (err) {
     return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to delete installment plan.' });
   }
@@ -2230,6 +2229,9 @@ apiRouter.post('/installments/:planId/pay', async (req, res) => {
     }
     if (!plan) {
       plan = await db.InstallmentPlan.findOne({ invoiceNo: req.params.planId, shopId: req.shopId });
+    }
+    if (!plan || plan.status === 'Archived') {
+      return res.status(404).json({ error: 'Active installment plan not found.' });
     }
 
     const calc = calculateInstallmentPayment({ plan, amount });
