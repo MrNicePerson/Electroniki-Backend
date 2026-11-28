@@ -549,6 +549,7 @@ apiRouter.post('/admin/shops', async (req, res, next) => {
   try {
     const { shopName, ownerName, email, password, phone = '', whatsapp = '', city = '', address = '', geminiApiKey = '' } = req.body || {};
     const cleanShop = String(shopName || '').trim();
+    if (!cleanShop || cleanShop.length > 120) return res.status(400).json({ error: 'Enter a shop name between 1 and 120 characters.' });
     const cleanOwner = String(ownerName || '').trim();
     const cleanEmail = String(email || '').trim().toLowerCase();
     const cleanPassword = String(password || '');
@@ -700,6 +701,23 @@ apiRouter.put('/admin/users/:id', async (req, res, next) => {
   }
 });
 
+apiRouter.delete('/admin/users/:id', async (req, res, next) => {
+  try {
+    const target = await db.User.findById(req.params.id);
+    if (!target || target.role === 'super_admin') return res.status(404).json({ error: 'Managed shop user not found.' });
+    if (target.role === 'owner' && target.active !== false) {
+      const owners = await db.User.find({ shopId: target.shopId, role: 'owner' });
+      if (owners.filter((owner) => owner.id !== target.id && owner.active !== false).length === 0) {
+        return res.status(400).json({ error: 'Add or activate another shop owner before deleting the last active owner.' });
+      }
+    }
+    await db.User.deleteOne({ _id: target.id });
+    await logAudit(target.shopId, req.user, 'platform_user_deleted', 'User', target.id, `Platform admin removed access for ${target.email}`);
+    return res.json({ ok: true, deletedUserId: target.id });
+  } catch (err) {
+    return next(err);
+  }
+});
 apiRouter.use((req, res, next) => {
   if (req.user?.role === 'super_admin') {
     return res.status(403).json({ error: 'Super Admin accounts can only use platform administration routes.' });
@@ -1785,6 +1803,7 @@ apiRouter.post('/sales', async (req, res) => {
           planNo: `PLAN-${invoiceNo.replace(/^[A-Z]+-/, '')}`,
           saleId: sale.id,
           invoiceNo: sale.invoiceNo,
+          padNo: sale.padNo || '',
           customerId: resolvedCustomer?.id || 'walkin',
           customerName: custName,
           installmentDetails: {
@@ -2018,6 +2037,7 @@ apiRouter.post('/installments/plans', async (req, res) => {
         planNo,
         saleId: sale.id,
         invoiceNo: sale.invoiceNo,
+        padNo: sale.padNo || '',
         customerId: customer.id,
         customerName: customer.name,
         installmentDetails: {
@@ -2109,6 +2129,7 @@ apiRouter.put('/installments/:planId', async (req, res) => {
         body.startDate !== undefined && !isValidDateOnly(body.startDate) || body.nextDueDate !== undefined && !isValidDateOnly(body.nextDueDate)) {
       return res.status(400).json({ error: 'Enter valid dates, 1–60 months, and a non-negative monthly amount.' });
     }
+    if (body.padNo !== undefined && String(body.padNo).length > 80 || body.productSummary !== undefined && String(body.productSummary).length > 1000) return res.status(400).json({ error: 'Pad number or product details are too long.' });
     const details = existing.installmentDetails || {};
     const customer = { ...(details.customer || {}) };
     const guarantor = { ...(details.guarantor || {}) };
@@ -2126,10 +2147,12 @@ apiRouter.put('/installments/:planId', async (req, res) => {
       phone: customer.phone || '', whatsapp: customer.whatsapp || '', cnic: customer.cnic || '', address: customer.address || '',
       guarantor: guarantor.name || '', guarantorPhone: guarantor.phone || '', guarantorCnic: guarantor.cnic || '', guarantorAddress: guarantor.address || '',
       months, monthlyAmount,
+      ...(body.productSummary !== undefined ? { productSummary: String(body.productSummary || '').trim() } : {}),
       startDate: nextPlanDetails.startDate || existing.startDate,
       nextDueDate: nextPlanDetails.nextDueDate || existing.nextDueDate,
       installmentDetails: { ...details, customer, guarantor, plan: nextPlanDetails },
     });
+    if (body.padNo !== undefined && existing.saleId) await db.Sale.updateOne({ _id: existing.saleId, shopId: req.shopId }, { padNo: String(body.padNo || '').trim() });
     await logAudit(req.shopId, req.user, 'installment_plan_edited', 'InstallmentPlan', existing.id,
       `Updated customer or schedule details for installment plan ${existing.planNo || existing.invoiceNo}`);
     return res.json({ plan: updated });

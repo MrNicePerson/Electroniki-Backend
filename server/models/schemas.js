@@ -169,6 +169,7 @@ const installmentPlanSchema = new Schema(
     planNo: { type: String, required: true },
     saleId: { type: String, default: '' },
     invoiceNo: { type: String, default: '' },
+    padNo: { type: String, default: '' },
     customerId: { type: String, default: '' },
     customerName: { type: String, required: true },
     installmentDetails: { type: Schema.Types.Mixed, default: {} },
